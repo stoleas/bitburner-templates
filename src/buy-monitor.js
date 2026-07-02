@@ -40,6 +40,13 @@ export async function main(ns) {
   // Track which openers we already have so we only fire on the *new* one.
   const have = new Set(OPENER_PROGRAMS.filter((p) => ns.fileExists(p, "home")));
 
+  // How long to keep retrying ns.run(DEPLOY) after nuke.js finishes.
+  // nuke.js frees its own RAM as it exits, but buy-monitor itself is
+  // still on home holding RAM — so the first deploy call can race and
+  // fail. 15s × 200ms = ~75 attempts is plenty.
+  const DEPLOY_RETRY_TIMEOUT_MS = 15_000;
+  const DEPLOY_RETRY_INTERVAL_MS = 200;
+
   while (true) {
     for (const p of OPENER_PROGRAMS) {
       if (have.has(p)) continue;
@@ -56,9 +63,17 @@ export async function main(ns) {
       // Wait for nuke.js to finish so deploy.js sees the new roots.
       while (ns.isRunning(nukePid)) await ns.sleep(500);
       ns.tprint(`buy-monitor: ${NUKE} done — starting ${DEPLOY}`);
-      const deployPid = ns.run(DEPLOY);
+      // Retry ns.run(DEPLOY) until it lands or we time out. The first
+      // call can fail when buy-monitor's own RAM footprint competes
+      // with deploy.js for free home RAM right as nuke.js is exiting.
+      const deployDeadline = Date.now() + DEPLOY_RETRY_TIMEOUT_MS;
+      let deployPid = 0;
+      while (deployPid === 0 && Date.now() < deployDeadline) {
+        deployPid = ns.run(DEPLOY);
+        if (deployPid === 0) await ns.sleep(DEPLOY_RETRY_INTERVAL_MS);
+      }
       if (deployPid === 0) {
-        ns.tprint(`buy-monitor: failed to start ${DEPLOY} — rerun manually`);
+        ns.tprint(`buy-monitor: failed to start ${DEPLOY} after ${DEPLOY_RETRY_TIMEOUT_MS / 1000}s — rerun manually`);
       } else {
         ns.tprint(`buy-monitor: ${DEPLOY} started (pid ${deployPid}). Exiting.`);
         return;
