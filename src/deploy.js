@@ -3,23 +3,30 @@
 // Deploy the worker script to every rooted, in-level target server and
 // run it with the maximum thread count that fits. This is the early-game
 // "fan out" pattern from the Beginners Guide: instead of one script on
-// home hacking n00dles, we put N copies of the script on N target
-// servers so the work actually scales.
+// home hacking a single target, we put N copies of the script on N
+// target servers so the work actually scales.
+//
+// Default worker is hack-loop.js. Override with the first positional
+// arg if you ever need a different worker.
 //
 // Usage:
-//   run deploy.js                            # default: n00dles.js as worker
+//   run deploy.js                            # default: hack-loop.js
 //   run deploy.js worker.js                  # custom worker name
 //
 // Worker contract: the worker takes a target hostname as its first arg
-// and runs the H/G/W loop against that target. n00dles.js already does
-// this; any script with the same shape will work.
+// and runs the H/G/W loop against that target. hack-loop.js does this.
 //
-// Every reachable server gets one status line so silent filters
-// (no-root, under-levelled, no-RAM, already-running) become visible —
-// no more "where is CSEC?".
-//
+const USAGE = `Usage:
+  run deploy.js                       # default: hack-loop.js as worker
+  run deploy.js worker.js             # custom worker name
+`;
+
 export async function main(ns) {
-  const worker = ns.args[0]?.toString() ?? "n00dles.js";
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
+  const worker = ns.args[0]?.toString() ?? "hack-loop.js";
   const SOURCE = "home";
 
   const me = ns.getPlayer();

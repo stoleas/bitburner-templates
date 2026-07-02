@@ -17,7 +17,17 @@
 // where upg = max(0, log2(ram) - 6). At default multipliers and ram<=64
 // GB that's just ram * $55k.
 //
+const USAGE = `Usage:
+  run buy-server.js           # default 64GB, hostname "pserv"
+  run buy-server.js 128       # 128GB
+  run buy-server.js 1024      # 1TB (bigger than any Tech Vendor offers)
+`;
+
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   // First positional arg is RAM in GB. Default 64 if missing.
   // Reject non-integer / negative / non-numeric input loudly so a
   // typo doesn't silently buy the default.

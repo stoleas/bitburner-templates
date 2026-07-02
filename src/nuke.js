@@ -15,7 +15,16 @@
 // port-opener programs for are also reported (with a count of how
 // many you're missing) and skipped.
 //
+const USAGE = `Usage:
+  run nuke.js                       # BFS the network, nuke every reachable host
+  run nuke.js --targets neo-net CSEC  # pin to specific servers
+`;
+
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   // Parse args. --targets <list...> takes the rest as the target list.
   const args = ns.args.slice();
   const targetsIdx = args.indexOf("--targets");

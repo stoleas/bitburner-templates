@@ -19,10 +19,10 @@
 // monitor doesn't spam your terminal.
 //
 // Usage:
-//   run backdoor-monitor.js                       # one full table on startup, then poll
-//   run backdoor-monitor.js --once                # print once, exit
-//   run backdoor-monitor.js --include-backdoored  # also list backdoored servers in the table
-//   run backdoor-monitor.js --show-path           # print full home→host path on separate lines
+//   run monitor-backdoor.js                       # one full table on startup, then poll
+//   run monitor-backdoor.js --once                # print once, exit
+//   run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
+//   run monitor-backdoor.js --show-path           # print full home→host path on separate lines
 //
 // Bitburner requires you to walk the path one hop at a time. The READY
 // line includes the `connect <a>; connect <b>; ...; backdoor` chain
@@ -36,10 +36,21 @@
 //
 // Note: this script does NOT need to be running for backdoors to work.
 // It's purely a "what's the state of my network" panel. Idempotent.
+//
+const USAGE = `Usage:
+  run monitor-backdoor.js                       # one full table on startup, then poll
+  run monitor-backdoor.js --once                # print once, exit
+  run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
+  run monitor-backdoor.js --show-path           # print full home→host path on separate lines
+`;
 
 const POLL_MS = 30_000;
 
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   ns.disableLog("sleep");
   ns.disableLog("scan");
   ns.disableLog("getServer");
@@ -197,7 +208,7 @@ export async function main(ns) {
     }
     // Header. We print the table even when empty so the user knows
     // the script is alive and there's nothing to backdoor.
-    const header = reason ? `backdoor-monitor (${reason}):` : `backdoor-monitor:`;
+    const header = reason ? `monitor-backdoor (${reason}):` : `monitor-backdoor:`;
     ns.tprint(header);
     if (lines.length === 0) {
       ns.tprint(`  (no READY servers; everything is backdoored, blocked, or out-of-level)`);

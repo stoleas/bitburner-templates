@@ -15,12 +15,20 @@
 //     + scp + exec manually.
 //   - Files with a stale in-memory worker don't auto-reload. Kill the
 //     old process before re-running deploy.js if you need the new
-//     version to take effect immediately.
+//   version to take effect immediately.
 //
 // Usage:
 //   run sync-all.js
 //
+const USAGE = `Usage:
+  run sync-all.js
+`;
+
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   const SOURCE = "home";
   const files = ns.ls(SOURCE, ".js").filter((f) => !f.endsWith(".d.ts"));
   if (files.length === 0) {
