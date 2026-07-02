@@ -81,8 +81,12 @@ function findShareHosts(ns) {
   const myHack = me.skills.hacking;
   const hosts = enumerateNetwork(ns, SOURCE);
   const out = [];
+  // Build candidates. home is excluded from the BFS list and handled
+  // explicitly below — the orchestrator (us) is itself a share.js
+  // instance on home, and we don't want fanOut's SKIP-running check
+  // to count us as a duplicate.
   for (const host of hosts) {
-    if (host === SOURCE) continue;     // home shares itself
+    if (host === SOURCE) continue;     // home is handled separately
     const s = ns.getServer(host);
     if (!s.hasAdminRights) continue;   // can't scp without root
     if (SHARE_INCLUDE_PURCHASED_ONLY && !s.purchasedByPlayer) continue;
@@ -199,27 +203,51 @@ export async function main(ns) {
   ns.tprint(`share: scanning ${hosts.length} eligible host(s), SHARE_INCLUDE_PURCHASED_ONLY=${SHARE_INCLUDE_PURCHASED_ONLY}`);
   fanOut(ns, hosts, counters);
 
-  // Phase 2: run the share loop on home itself. This is the part that
-  // contributes HOME's free RAM. The fanned-out copies contribute
-  // their own hosts' RAM in parallel.
-  // Run the home loop in the background so it doesn't block --once
-  // exits. ns.share() needs the script to stay alive, so we just
-  // await the loop directly — Bitburner keeps the script running
-  // until the process is killed or sleep returns.
+  // Spawn a child share copy on home. We can't reuse fanOut() for this
+  // because fanOut's SKIP-running check would match the orchestrator
+  // process itself. The child runs in its own process, so its
+  // ns.share()/ns.sleep() calls don't contend with this orchestrator's
+  // rescan ns.sleep().
+  const homeRam = ns.getScriptRam(SELF, SOURCE);
+  const homeFree = ns.getServerMaxRam(SOURCE) - ns.getServerUsedRam(SOURCE);
+  const homeThreads = Math.max(1, Math.floor(homeFree / homeRam));
+  if (homeRam > 0 && homeThreads >= 1) {
+    const homePid = ns.exec(SELF, SOURCE, homeThreads, "--child");
+    if (homePid > 0) {
+      counters["SHARED"]++;
+      ns.tprint(`SHARED          ${SOURCE}  ${SELF} x${homeThreads} (pid ${homePid})`);
+    } else {
+      counters["FAIL-exec"]++;
+      ns.tprint(`FAIL-exec       ${SOURCE}  (could not spawn home child)`);
+    }
+  } else {
+    ns.tprint(`SKIP-ram        ${SOURCE}  (no free RAM: ${homeFree.toFixed(2)} GB, ${SELF} needs ${homeRam.toFixed(2)} GB)`);
+    counters["SKIP-ram"]++;
+  }
+
+  const summary = Object.entries(counters)
+    .filter(([_, v]) => v > 0)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+
   if (once) {
-    const summary = Object.entries(counters)
-      .filter(([_, v]) => v > 0)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(" ");
+    // Fan-out only: the spawned child share copies keep sharing after
+    // this orchestrator exits. Each child runs in its own process, so
+    // no NS-runtime contention with the parent.
     ns.tprint(`done (--once): ${summary || "no changes"} (scanned ${hosts.length} hosts)`);
     return;
   }
 
+  // The orchestrator process is now NS-idle on home. Home's share
+  // contribution comes from the --child share copy spawned on home
+  // explicitly above. This split is mandatory: keeping a
+  // runShareLoop() in this process alongside the rescan ns.sleep()
+  // triggers the "Concurrent calls to Netscript functions" runtime
+  // error.
   // Default: stay alive and re-fan-out every SHARE_RESCAN_MS, so
   // newly-nuked hosts pick up a share copy without manual intervention.
   // ns.exec on a server that already has a share copy is a no-op
   // (SKIP-running), so this is safe.
-  const homeLoop = runShareLoop(ns, { label: SOURCE, quiet });
   let lastRescan = Date.now();
   while (true) {
     await ns.sleep(60_000);
