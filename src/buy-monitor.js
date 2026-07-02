@@ -25,6 +25,13 @@ const OPENER_PROGRAMS = [
   "relaySMTP.exe",
   "HTTPWorm.exe",
   "SQLInject.exe",
+  // Not port-openers, but useful unlocks — AutoLink lets scan-analyze
+  // connect directly, ServerProfiler/Deepscan give better visibility.
+  // Any new file on home fires the nuke+deploy chain.
+  "AutoLink.exe",
+  "ServerProfiler.exe",
+  "DeepscanV1.exe",
+  "DeepscanV2.exe",
 ];
 
 export async function main(ns) {
