@@ -52,6 +52,12 @@
 // for even one share.js thread, we SKIP-ram instead of kicking the
 // existing worker out. You can also restrict to purchased servers only
 // by setting SHARE_INCLUDE_PURCHASED_ONLY=true at the top of the file.
+//
+const USAGE = `Usage:
+  run share.js                 # start the daemon (one-shot; auto-loops)
+  run share.js --once          # fan out + share once, then exit
+  run share.js --quiet         # suppress per-cycle status prints
+`;
 
 const SHARE_RAM_COST = 2.4;     // ns.share()'s RAM cost per call
 const SHARE_BOOST_MS = 10_000;  // ns.share()'s boost duration
@@ -173,6 +179,10 @@ function fanOut(ns, hosts, counters) {
 }
 
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   const args = (ns.args || []).map(String);
   const once = args.includes("--once");
   const quiet = args.includes("--quiet");

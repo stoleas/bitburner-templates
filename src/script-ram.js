@@ -4,7 +4,15 @@
 // RAM cost. Helps diagnose "why is home out of RAM" or "what's eating
 // 5 GB on foo".
 //
+const USAGE = `Usage:
+  run script-ram.js
+`;
+
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   // Probe: ns.ps(host) returns all processes on a server.
   // ns.getScriptRam(script, host) returns the cost per thread.
   const hosts = ["home", ...ns.scan("home")];

@@ -6,7 +6,7 @@
 // without you babysitting the terminal.
 //
 // Usage:
-//   run buy-monitor.js
+//   run monitor-buy.js
 //
 // Polls every 30s. When a new *.exe in the opener list appears on
 // home, it kicks off nuke.js, waits for that to finish, then runs
@@ -15,6 +15,10 @@
 // The opener list is what nuke.js looks for; we only fire when a new
 // member of that list lands.
 //
+const USAGE = `Usage:
+  run monitor-buy.js
+`;
+
 const POLL_MS = 30_000;
 const NUKE = "nuke.js";
 const DEPLOY = "deploy.js";
@@ -35,13 +39,17 @@ const OPENER_PROGRAMS = [
 ];
 
 export async function main(ns) {
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   ns.disableLog("sleep");
-  ns.tprint(`buy-monitor: watching for ${OPENER_PROGRAMS.join(", ")}`);
+  ns.tprint(`monitor-buy: watching for ${OPENER_PROGRAMS.join(", ")}`);
   // Track which openers we already have so we only fire on the *new* one.
   const have = new Set(OPENER_PROGRAMS.filter((p) => ns.fileExists(p, "home")));
 
   // How long to keep retrying ns.run(DEPLOY) after nuke.js finishes.
-  // nuke.js frees its own RAM as it exits, but buy-monitor itself is
+  // nuke.js frees its own RAM as it exits, but monitor-buy itself is
   // still on home holding RAM — so the first deploy call can race and
   // fail. 15s × 200ms = ~75 attempts is plenty.
   const DEPLOY_RETRY_TIMEOUT_MS = 15_000;
@@ -53,18 +61,18 @@ export async function main(ns) {
       if (!ns.fileExists(p, "home")) continue;
       // New opener landed!
       have.add(p);
-      ns.tprint(`buy-monitor: ${p} arrived on home — running ${NUKE} then ${DEPLOY}`);
+      ns.tprint(`monitor-buy: ${p} arrived on home — running ${NUKE} then ${DEPLOY}`);
       const nukePid = ns.run(NUKE);
       if (nukePid === 0) {
-        ns.tprint(`buy-monitor: failed to start ${NUKE} (not enough RAM?) — will retry on next poll`);
+        ns.tprint(`monitor-buy: failed to start ${NUKE} (not enough RAM?) — will retry on next poll`);
         have.delete(p);
         continue;
       }
       // Wait for nuke.js to finish so deploy.js sees the new roots.
       while (ns.isRunning(nukePid)) await ns.sleep(500);
-      ns.tprint(`buy-monitor: ${NUKE} done — starting ${DEPLOY}`);
+      ns.tprint(`monitor-buy: ${NUKE} done — starting ${DEPLOY}`);
       // Retry ns.run(DEPLOY) until it lands or we time out. The first
-      // call can fail when buy-monitor's own RAM footprint competes
+      // call can fail when monitor-buy's own RAM footprint competes
       // with deploy.js for free home RAM right as nuke.js is exiting.
       const deployDeadline = Date.now() + DEPLOY_RETRY_TIMEOUT_MS;
       let deployPid = 0;
@@ -73,9 +81,9 @@ export async function main(ns) {
         if (deployPid === 0) await ns.sleep(DEPLOY_RETRY_INTERVAL_MS);
       }
       if (deployPid === 0) {
-        ns.tprint(`buy-monitor: failed to start ${DEPLOY} after ${DEPLOY_RETRY_TIMEOUT_MS / 1000}s — rerun manually`);
+        ns.tprint(`monitor-buy: failed to start ${DEPLOY} after ${DEPLOY_RETRY_TIMEOUT_MS / 1000}s — rerun manually`);
       } else {
-        ns.tprint(`buy-monitor: ${DEPLOY} started (pid ${deployPid}). Exiting.`);
+        ns.tprint(`monitor-buy: ${DEPLOY} started (pid ${deployPid}). Exiting.`);
         return;
       }
     }

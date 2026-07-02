@@ -4,6 +4,10 @@ export async function main(ns) {
   // augmentation (SF-4 in BitNode 4) — if you don't have it, this will
   // throw on first use. Without Singularity, you can still train stats
   // manually from the city UI.
+  if (ns.args.includes("-h") || ns.args.includes("--help")) {
+    ns.tprint(USAGE);
+    return;
+  }
   if (!ns.singularity) {
     ns.tprint("ERROR: ns.singularity is not available. Install the Singularity augmentation first.");
     return;
@@ -21,8 +25,15 @@ export async function main(ns) {
   //
   // Default (no args): cycle str, def, dex, agi, switching every
   // 60 minutes of in-game time.
+//
+const USAGE = `Usage:
+  run stat-train.js                  # cycle str/def/dex/agi, rotating every 60 in-game min
+  run stat-train.js str def dex agi  # explicit gym stats
+  run stat-train.js hack cha int     # university stats
+  run stat-train.js str def hack     # mix
+`;
 
-  const GYM = {
+const GYM = {
     str: { gym: "Sector12PowerhouseGym", stat: "str" },
     def: { gym: "Sector12PowerhouseGym", stat: "def" },
     dex: { gym: "Sector12IronGym",       stat: "dex" },
