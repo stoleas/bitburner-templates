@@ -68,8 +68,10 @@ export async function main(ns) {
 
     const s = ns.getServer(host);
 
+    // Skip purchased servers — they have no money to hack. Run
+    // deploy-share.js to put share.js on them instead.
     if (s.purchasedByPlayer) {
-      ns.tprint(`SKIP-purchased  ${host}`);
+      ns.tprint(`SKIP-purchased  ${host}  (run deploy-share.js to put share.js here)`);
       counters["SKIP-purchased"]++;
       continue;
     }

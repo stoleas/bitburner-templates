@@ -17,7 +17,9 @@ import { NS } from "@ns";
  * the heavy work runs on the target server.
  */
 export async function main(ns: NS): Promise<void> {
-  const target = "foodnstuff";
+  // Target defaults to foodnstuff for standalone use. The deploy script
+  // passes the host as the first arg so each server hacks itself.
+  const target = (ns.args[0]?.toString() ?? "foodnstuff").trim();
 
   // Ensure root access. foodnstuff requires 0 port opens, so a single nuke works.
   if (!ns.hasRootAccess(target)) {
