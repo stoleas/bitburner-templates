@@ -137,11 +137,17 @@ export async function main(ns) {
     }
   }
 
-  // Summary line is always printed — it's the single line you watch for
-  // "did anything get nuked" (NUKED=0) or "is something broken" (FAIL-*>0).
+  // In quiet mode, suppress the summary line entirely when nothing
+  // interesting happened. We only print it if at least one NUKED
+  // (the whole point of running this) or any FAIL- (real issue).
+  // In verbose mode, always print the summary — it's the per-run
+  // report you can scroll back through.
   const summary = Object.entries(counters)
     .filter(([_, v]) => v > 0)
     .map(([k, v]) => `${k}=${v}`)
     .join(" ");
-  ns.tprint(`done: ${summary} (scanned ${hosts.length} hosts)`);
+  const interesting = counters.NUKED > 0 || counters["FAIL-notfound"] > 0 || counters["FAIL-nuke"] > 0;
+  if (!quiet || interesting) {
+    ns.tprint(`done: ${summary} (scanned ${hosts.length} hosts)`);
+  }
 }

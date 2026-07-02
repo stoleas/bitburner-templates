@@ -30,9 +30,10 @@
 //      that host's free RAM to the global share-power pool.
 //
 // Usage:
-//   run share.js                 # start the daemon (one-shot; auto-loops)
-//   run share.js --once          # fan out + share once, then exit
-//   run share.js --quiet         # suppress per-cycle status prints
+//   run share.js                 # start the daemon (one-shot; auto-loops), QUIET by default
+//   run share.js --once          # fan out + share once, then exit (full output)
+//   run share.js --verbose       # re-enable per-host SKIP / FAIL / SHARED lines
+//   run share.js --quiet         # (alias for the default; suppress per-cycle and per-host prints)
 //
 // RAM cost: ns.share() = 2.4 GB per call. We run with as many threads
 // as fit, so on home (32 GB default-ish in early game) the script uses
@@ -54,9 +55,10 @@
 // by setting SHARE_INCLUDE_PURCHASED_ONLY=true at the top of the file.
 //
 const USAGE = `Usage:
-  run share.js                 # start the daemon (one-shot; auto-loops)
-  run share.js --once          # fan out + share once, then exit
-  run share.js --quiet         # suppress per-cycle status prints
+  run share.js                 # start the daemon (one-shot; auto-loops), QUIET by default
+  run share.js --once          # fan out + share once with full output, then exit
+  run share.js --verbose       # re-enable per-host SKIP / FAIL / SHARED lines
+  run share.js --quiet         # (alias for the default; suppress per-cycle and per-host prints)
 `;
 
 const SHARE_RAM_COST = 2.4;     // ns.share()'s RAM cost per call
@@ -133,7 +135,10 @@ async function runShareLoop(ns, opts) {
 }
 
 /** Fan out copies of share.js to every eligible host. */
-function fanOut(ns, hosts, counters) {
+function fanOut(ns, hosts, counters, opts) {
+  // opts.verbose: print per-host lines. When false, suppress the noise
+  // and only return counters for the summary.
+  const verbose = opts && opts.verbose;
   // Make sure share.js exists on home so we can scp it.
   if (!ns.fileExists(SELF, SOURCE)) {
     ns.tprint(`ERROR: ${SELF} not on ${SOURCE}. Push it via filesync first.`);
@@ -142,13 +147,13 @@ function fanOut(ns, hosts, counters) {
   for (const host of hosts) {
     // Skip if a copy is already running here.
     if (ns.ps(host).some((p) => p.filename === SELF)) {
-      ns.tprint(`SKIP-running    ${host}  (${SELF} already running)`);
+      if (verbose) ns.tprint(`SKIP-running    ${host}  (${SELF} already running)`);
       counters["SKIP-running"]++;
       continue;
     }
     // Copy the script to the target.
     if (!ns.scp(SELF, host, SOURCE)) {
-      ns.tprint(`FAIL-scp        ${host}`);
+      if (verbose) ns.tprint(`FAIL-scp        ${host}`);
       counters["FAIL-scp"]++;
       continue;
     }
@@ -161,7 +166,7 @@ function fanOut(ns, hosts, counters) {
     const free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host);
     const threads = Math.max(1, Math.floor(free / ramPerThread));
     if (threads < 1 || ramPerThread <= 0) {
-      ns.tprint(`SKIP-ram        ${host}  (no free RAM: ${free.toFixed(2)} GB, ${SELF} needs ${ramPerThread.toFixed(2)} GB)`);
+      if (verbose) ns.tprint(`SKIP-ram        ${host}  (no free RAM: ${free.toFixed(2)} GB, ${SELF} needs ${ramPerThread.toFixed(2)} GB)`);
       counters["SKIP-ram"]++;
       continue;
     }
@@ -169,10 +174,12 @@ function fanOut(ns, hosts, counters) {
     // doesn't recurse into its own fan-out.
     const pid = ns.exec(SELF, host, threads, "--child");
     if (pid === 0) {
-      ns.tprint(`FAIL-exec       ${host}  (exec returned 0 — RAM contention or other script running)`);
+      if (verbose) ns.tprint(`FAIL-exec       ${host}  (exec returned 0 — RAM contention or other script running)`);
       counters["FAIL-exec"]++;
       continue;
     }
+    // SHARED is the interesting event — always print it, even in
+    // quiet mode. That's the whole point of running share.js.
     ns.tprint(`SHARED          ${host}  ${SELF} x${threads} (pid ${pid})`);
     counters["SHARED"]++;
   }
@@ -185,7 +192,11 @@ export async function main(ns) {
   }
   const args = (ns.args || []).map(String);
   const once = args.includes("--once");
-  const quiet = args.includes("--quiet");
+  const verbose = args.includes("--verbose");
+  // Default quiet for the daemon loop. --once is the diagnostic path
+  // and always prints full output. If the user passes both --quiet
+  // and --verbose, --quiet wins (they explicitly asked for it).
+  const quiet = args.includes("--quiet") || (!verbose && !once);
   const child = args.includes("--child");
 
   // Child mode: just run the share loop on this host. Never recurse
@@ -209,9 +220,13 @@ export async function main(ns) {
   };
 
   // Phase 1: fan out copies to every eligible host. Re-runs safely.
+  // In quiet mode, fanOut suppresses per-host SKIP/FAIL lines but
+  // still prints SHARED (the interesting event).
   const hosts = findShareHosts(ns);
-  ns.tprint(`share: scanning ${hosts.length} eligible host(s), SHARE_INCLUDE_PURCHASED_ONLY=${SHARE_INCLUDE_PURCHASED_ONLY}`);
-  fanOut(ns, hosts, counters);
+  if (verbose) {
+    ns.tprint(`share: scanning ${hosts.length} eligible host(s), SHARE_INCLUDE_PURCHASED_ONLY=${SHARE_INCLUDE_PURCHASED_ONLY}`);
+  }
+  fanOut(ns, hosts, counters, { verbose });
 
   // Spawn a child share copy on home. We can't reuse fanOut() for this
   // because fanOut's SKIP-running check would match the orchestrator
@@ -228,10 +243,10 @@ export async function main(ns) {
       ns.tprint(`SHARED          ${SOURCE}  ${SELF} x${homeThreads} (pid ${homePid})`);
     } else {
       counters["FAIL-exec"]++;
-      ns.tprint(`FAIL-exec       ${SOURCE}  (could not spawn home child)`);
+      if (verbose) ns.tprint(`FAIL-exec       ${SOURCE}  (could not spawn home child)`);
     }
   } else {
-    ns.tprint(`SKIP-ram        ${SOURCE}  (no free RAM: ${homeFree.toFixed(2)} GB, ${SELF} needs ${homeRam.toFixed(2)} GB)`);
+    if (verbose) ns.tprint(`SKIP-ram        ${SOURCE}  (no free RAM: ${homeFree.toFixed(2)} GB, ${SELF} needs ${homeRam.toFixed(2)} GB)`);
     counters["SKIP-ram"]++;
   }
 
@@ -258,6 +273,10 @@ export async function main(ns) {
   // newly-nuked hosts pick up a share copy without manual intervention.
   // ns.exec on a server that already has a share copy is a no-op
   // (SKIP-running), so this is safe.
+  // The per-cycle ns.print() in runShareLoop is also gated on !quiet
+  // (see runShareLoop). So in quiet mode the only output during a
+  // rescan is the summary line (and only if something actually changed).
+  if (verbose) ns.tprint(`share: started, output=verbose, rescan=${SHARE_RESCAN_MS}ms`);
   let lastRescan = Date.now();
   while (true) {
     await ns.sleep(60_000);
@@ -266,7 +285,7 @@ export async function main(ns) {
       const nextSet = new Set(next);
       // Reset counters for the diff print; cumulative isn't useful here.
       for (const k of Object.keys(counters)) counters[k] = 0;
-      fanOut(ns, next, counters);
+      fanOut(ns, next, counters, { verbose });
       const summary = Object.entries(counters)
         .filter(([_, v]) => v > 0)
         .map(([k, v]) => `${k}=${v}`)
