@@ -8,16 +8,19 @@
 // Usage:
 //   run nuke.js                       # BFS the network, nuke every reachable host
 //   run nuke.js --targets neo-net CSEC  # pin to specific servers
+//   run nuke.js --quiet               # only print NUKED / FAIL / summary (suppress SKIP lines)
 //
 // Out-of-level targets are reported (so you can see what you're
 // missing) but not acted on — nuke() silently fails on under-levelled
 // hosts, so we filter before trying. Servers you don't have the
 // port-opener programs for are also reported (with a count of how
-// many you're missing) and skipped.
+// many you're missing) and skipped. Pass --quiet to suppress the
+// SKIP-* noise and only see NUKED / FAIL / summary.
 //
 const USAGE = `Usage:
-  run nuke.js                       # BFS the network, nuke every reachable host
-  run nuke.js --targets neo-net CSEC  # pin to specific servers
+  run nuke.js                          # BFS the network, nuke every reachable host
+  run nuke.js --targets neo-net CSEC   # pin to specific servers
+  run nuke.js --quiet                  # only print NUKED / FAIL / summary
 `;
 
 export async function main(ns) {
@@ -27,6 +30,7 @@ export async function main(ns) {
   }
   // Parse args. --targets <list...> takes the rest as the target list.
   const args = ns.args.slice();
+  const quiet = args.includes("--quiet");
   const targetsIdx = args.indexOf("--targets");
   const pinned = targetsIdx >= 0 ? args.slice(targetsIdx + 1) : null;
 
@@ -70,13 +74,13 @@ export async function main(ns) {
 
   for (const host of hosts) {
     if (host === "home") {
-      ns.tprint(`SKIP-self      home`);
+      if (!quiet) ns.tprint(`SKIP-self      home`);
       counters["SKIP-self"]++;
       continue;
     }
 
     if (ns.hasRootAccess(host)) {
-      ns.tprint(`SKIP-rooted    ${host}  (already rooted)`);
+      if (!quiet) ns.tprint(`SKIP-rooted    ${host}  (already rooted)`);
       counters["SKIP-rooted"]++;
       continue;
     }
@@ -85,6 +89,8 @@ export async function main(ns) {
     // getServerNumPortsRequired returns -1 for unknown hostnames.
     const needed = ns.getServerNumPortsRequired(host);
     if (needed < 0) {
+      // FAIL lines are always printed — they signal a real issue
+      // (typo in --targets, or a server that needs a backdoor first).
       ns.tprint(`FAIL-notfound  ${host}  (host not in network — BFS may need a purchase or a backdoor)`);
       counters["FAIL-notfound"]++;
       continue;
@@ -94,7 +100,7 @@ export async function main(ns) {
     // getServer() works on unknown hosts in Bitburner, so this is safe.
     const s = ns.getServer(host);
     if (s.purchasedByPlayer) {
-      ns.tprint(`SKIP-purchased ${host}`);
+      if (!quiet) ns.tprint(`SKIP-purchased ${host}`);
       counters["SKIP-purchased"]++;
       continue;
     }
@@ -104,7 +110,7 @@ export async function main(ns) {
     // missing — but we don't try to nuke.
     const reqHack = ns.getServerRequiredHackingLevel(host);
     if (reqHack > myHack) {
-      ns.tprint(`SKIP-hack      ${host}  (need hack ${reqHack}, you have ${myHack})`);
+      if (!quiet) ns.tprint(`SKIP-hack      ${host}  (need hack ${reqHack}, you have ${myHack})`);
       counters["SKIP-hack"]++;
       continue;
     }
@@ -114,7 +120,7 @@ export async function main(ns) {
     for (const op of haveOpeners) op.open(host);
 
     if (haveOpeners.length < needed) {
-      ns.tprint(`SKIP-port      ${host}  (need ${needed} port-opener programs, you have ${haveOpeners.length}: ${haveOpeners.map((o) => o.file).join(", ") || "none"})`);
+      if (!quiet) ns.tprint(`SKIP-port      ${host}  (need ${needed} port-opener programs, you have ${haveOpeners.length}: ${haveOpeners.map((o) => o.file).join(", ") || "none"})`);
       counters["SKIP-port"]++;
       continue;
     }
@@ -125,11 +131,14 @@ export async function main(ns) {
       ns.tprint(`NUKED          ${host}`);
       counters["NUKED"]++;
     } else {
+      // FAIL-nuke is always printed (rare, indicates a bug).
       ns.tprint(`FAIL-nuke      ${host}  (ports opened, hack sufficient, but nuke failed — bug?)`);
       counters["FAIL-nuke"]++;
     }
   }
 
+  // Summary line is always printed — it's the single line you watch for
+  // "did anything get nuked" (NUKED=0) or "is something broken" (FAIL-*>0).
   const summary = Object.entries(counters)
     .filter(([_, v]) => v > 0)
     .map(([k, v]) => `${k}=${v}`)
