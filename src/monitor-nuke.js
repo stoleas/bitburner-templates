@@ -9,10 +9,10 @@
 // hosts, so subsequent passes are mostly no-ops except for any new
 // server that became reachable (new purchase, new backdoor, etc.).
 //
-// --quiet is forwarded to nuke.js, so SKIP-* noise is suppressed
-// and you only see NUKED / FAIL / summary lines (the interesting
-// events). Recommended for the always-on monitor — otherwise the
-// terminal fills up with the same SKIP-hack lines every interval.
+// Output defaults to QUIET — only NUKED / FAIL / summary lines are
+// printed. Otherwise the terminal fills up with the same SKIP-hack
+// lines every interval. Pass --verbose to re-enable per-host SKIP
+// output. --once always prints full output (it's a diagnostic run).
 //
 // Why a separate file:
 //   nuke.js is the one-shot version. Players with limited home RAM
@@ -25,18 +25,18 @@
 // standard build pipeline).
 //
 // Usage:
-//   run monitor-nuke.js                       # loop, every 60s
-//   run monitor-nuke.js --once                # one nuke.js pass, then exit
-//   run monitor-nuke.js --interval 30000      # loop, every 30s
-//   run monitor-nuke.js --targets CSEC        # pin mode (passed to nuke.js)
-//   run monitor-nuke.js --quiet               # pass --quiet to nuke.js (suppress SKIP lines)
+//   run monitor-nuke.js                       # loop, every 60s, QUIET (default)
+//   run monitor-nuke.js --once                # one nuke.js pass with full output, then exit
+//   run monitor-nuke.js --interval 30000      # loop, every 30s, QUIET
+//   run monitor-nuke.js --targets CSEC        # pin mode (passed to nuke.js), QUIET
+//   run monitor-nuke.js --verbose             # loop with per-host SKIP lines (the old loud behavior)
 //
 const USAGE = `Usage:
-  run monitor-nuke.js                          # loop, every 60s
-  run monitor-nuke.js --once                   # one nuke.js pass, then exit
-  run monitor-nuke.js --interval 30000         # loop, every 30s
-  run monitor-nuke.js --targets neo-net CSEC   # pin mode (passed to nuke.js)
-  run monitor-nuke.js --quiet                  # pass --quiet to nuke.js (suppress SKIP lines)
+  run monitor-nuke.js                          # loop, every 60s, QUIET (default)
+  run monitor-nuke.js --once                   # one nuke.js pass with full output, then exit
+  run monitor-nuke.js --interval 30000         # loop, every 30s, QUIET
+  run monitor-nuke.js --targets neo-net CSEC   # pin mode (passed to nuke.js), QUIET
+  run monitor-nuke.js --verbose                # loop with per-host SKIP lines (the old loud behavior)
 `;
 
 const NUKE = "nuke.js";
@@ -58,8 +58,10 @@ export async function main(ns) {
 
   // Parse args. --targets and its positional list pass through to
   // nuke.js verbatim. --once means a single nuke.js run then exit.
+  // --verbose opts back into per-host SKIP lines; default is quiet.
   const args = ns.args.slice();
   const once = args.includes("--once");
+  const verbose = args.includes("--verbose");
   const intervalIdx = args.indexOf("--interval");
   const intervalMs = intervalIdx >= 0
     ? Number(args[intervalIdx + 1])
@@ -70,15 +72,21 @@ export async function main(ns) {
   }
 
   // Strip our flags from the arg list before forwarding to nuke.js.
-  // nuke.js doesn't know about --once or --interval, so we remove
-  // those and pass everything else through (notably --targets and
-  // its positional list).
+  // nuke.js doesn't know about --once, --interval, or --verbose, so
+  // we remove those. --quiet is special: we ADD it by default (unless
+  // the user passed --verbose or --once, which always want full output).
   const nukeArgs = args.filter((_, i) => {
     if (args[i - 1] === "--interval") return false;  // the value after --interval
     if (args[i] === "--once") return false;
     if (args[i] === "--interval") return false;
+    if (args[i] === "--verbose") return false;
     return true;
   });
+  // Default to quiet. --verbose opts out. --once always wants full
+  // output (it's a diagnostic run).
+  if (!verbose && !once && !nukeArgs.includes("--quiet")) {
+    nukeArgs.push("--quiet");
+  }
 
   // One nuke.js invocation. nuke.js does its own printing; we wait
   // for it to finish so we know when to fire the next tick.
@@ -97,7 +105,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-nuke: started, interval=${intervalMs}ms, nuke-args=[${nukeArgs.join(" ") || "(none)"}]`);
+  ns.tprint(`monitor-nuke: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, nuke-args=[${nukeArgs.join(" ") || "(none)"}]`);
   while (true) {
     await runNukeOnce();
     await ns.sleep(intervalMs);
