@@ -1,14 +1,27 @@
 /** @param {NS} ns */
+//
+// Open every required port on every reachable server, then ns.nuke it.
+// Idempotent — safe to re-run. Scans the whole network reachable from
+// home by default, so newly-purchased servers / freshly-unlocked paths
+// get nuked without editing a list.
+//
+// Usage:
+//   run nuke.js                       # BFS the network, nuke every reachable host
+//   run nuke.js --targets neo-net CSEC  # pin to specific servers
+//
+// Out-of-level targets are reported (so you can see what you're
+// missing) but not acted on — nuke() silently fails on under-levelled
+// hosts, so we filter before trying. Servers you don't have the
+// port-opener programs for are also reported (with a count of how
+// many you're missing) and skipped.
+//
 export async function main(ns) {
-  const defaults = [
-    "n00dles", "foodnstuff", "sigma-cosmetics", "max-hardware",
-    "joesguns", "hong-fang-tea", "phantasy", "omega-net",
-  ];
-  // Filter out the --targets marker, keep the rest as the host list.
-  const argTargets = ns.args.filter((a) => a !== "--targets");
-  const list = argTargets.length > 0 ? argTargets : defaults;
+  // Parse args. --targets <list...> takes the rest as the target list.
+  const args = ns.args.slice();
+  const targetsIdx = args.indexOf("--targets");
+  const pinned = targetsIdx >= 0 ? args.slice(targetsIdx + 1) : null;
 
-  // (program filename on home, opener function on ns)
+  // Opener programs on home and the matching NS functions.
   const openers = [
     { file: "BruteSSH.exe",  open: (h) => ns.brutessh(h) },
     { file: "FTPCrack.exe",  open: (h) => ns.ftpcrack(h) },
@@ -17,30 +30,100 @@ export async function main(ns) {
     { file: "SQLInject.exe", open: (h) => ns.sqlinject(h) },
   ];
 
-  let nuked = 0, skipped = 0, failed = 0;
+  // Build the target list. Pinned mode skips the BFS.
+  let hosts;
+  if (pinned) {
+    hosts = pinned;
+  } else {
+    const seen = new Set(["home"]);
+    const queue = ["home"];
+    while (queue.length > 0) {
+      const h = queue.shift();
+      for (const n of ns.scan(h)) {
+        if (!seen.has(n)) { seen.add(n); queue.push(n); }
+      }
+    }
+    hosts = [...seen].sort();
+  }
 
-  for (const host of list) {
-    if (ns.hasRootAccess(host)) {
-      ns.tprint(`SKIP ${host} (already rooted)`);
-      skipped++;
+  const myHack = ns.getPlayer().skills.hacking;
+
+  const counters = {
+    "NUKED": 0,
+    "SKIP-rooted": 0,
+    "SKIP-self": 0,
+    "SKIP-purchased": 0,
+    "SKIP-hack": 0,
+    "SKIP-port": 0,
+    "FAIL-notfound": 0,
+    "FAIL-nuke": 0,
+  };
+
+  for (const host of hosts) {
+    if (host === "home") {
+      ns.tprint(`SKIP-self      home`);
+      counters["SKIP-self"]++;
       continue;
     }
 
-    const needed = ns.getServerNumPortsRequired(host);
-    for (const op of openers) {
-      if (ns.fileExists(op.file, "home")) op.open(host);
+    if (ns.hasRootAccess(host)) {
+      ns.tprint(`SKIP-rooted    ${host}  (already rooted)`);
+      counters["SKIP-rooted"]++;
+      continue;
     }
 
-    // Re-check root; if nuke succeeded we're done. If not, we don't have
-    // enough ports opened.
+    // Check the server exists in the network.
+    // getServerNumPortsRequired returns -1 for unknown hostnames.
+    const needed = ns.getServerNumPortsRequired(host);
+    if (needed < 0) {
+      ns.tprint(`FAIL-notfound  ${host}  (host not in network — BFS may need a purchase or a backdoor)`);
+      counters["FAIL-notfound"]++;
+      continue;
+    }
+
+    // Filter out purchased servers — you own those, you don't "nuke" them.
+    // getServer() works on unknown hosts in Bitburner, so this is safe.
+    const s = ns.getServer(host);
+    if (s.purchasedByPlayer) {
+      ns.tprint(`SKIP-purchased ${host}`);
+      counters["SKIP-purchased"]++;
+      continue;
+    }
+
+    // Hack-level check. nuke() silently fails under-levelled, so we filter.
+    // We still *report* the level block, so the user can see what they're
+    // missing — but we don't try to nuke.
+    const reqHack = ns.getServerRequiredHackingLevel(host);
+    if (reqHack > myHack) {
+      ns.tprint(`SKIP-hack      ${host}  (need hack ${reqHack}, you have ${myHack})`);
+      counters["SKIP-hack"]++;
+      continue;
+    }
+
+    // Open every port we have a program for.
+    const haveOpeners = openers.filter((o) => ns.fileExists(o.file, "home"));
+    for (const op of haveOpeners) op.open(host);
+
+    if (haveOpeners.length < needed) {
+      ns.tprint(`SKIP-port      ${host}  (need ${needed} port-opener programs, you have ${haveOpeners.length}: ${haveOpeners.map((o) => o.file).join(", ") || "none"})`);
+      counters["SKIP-port"]++;
+      continue;
+    }
+
+    // Try to nuke.
+    ns.nuke(host);
     if (ns.hasRootAccess(host)) {
-      ns.tprint(`NUKED ${host}`);
-      nuked++;
+      ns.tprint(`NUKED          ${host}`);
+      counters["NUKED"]++;
     } else {
-      ns.tprint(`FAIL  ${host} (need ${needed} ports — missing port-opener programs on home)`);
-      failed++;
+      ns.tprint(`FAIL-nuke      ${host}  (ports opened, hack sufficient, but nuke failed — bug?)`);
+      counters["FAIL-nuke"]++;
     }
   }
 
-  ns.tprint(`done: nuked=${nuked} skipped=${skipped} failed=${failed}`);
+  const summary = Object.entries(counters)
+    .filter(([_, v]) => v > 0)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  ns.tprint(`done: ${summary} (scanned ${hosts.length} hosts)`);
 }

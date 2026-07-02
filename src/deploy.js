@@ -14,15 +14,14 @@
 // and runs the H/G/W loop against that target. n00dles.js already does
 // this; any script with the same shape will work.
 //
+// Every reachable server gets one status line so silent filters
+// (no-root, under-levelled, no-RAM, already-running) become visible —
+// no more "where is CSEC?".
+//
 export async function main(ns) {
   const worker = ns.args[0]?.toString() ?? "n00dles.js";
   const SOURCE = "home";
 
-  // Hosts the worker will try to run on. We pass each rooted target as
-  // the *arg* to the worker, but the script itself runs on the target
-  // server (so its RAM costs come from the target's RAM, not home's).
-  // This is the key insight: home just orchestrates; the work happens
-  // on the targets, which have 16-32 GB each.
   const me = ns.getPlayer();
   const myHack = me.skills.hacking;
 
@@ -36,20 +35,6 @@ export async function main(ns) {
     }
   }
 
-  // Filter to rooted, money-bearing, in-hack-range targets.
-  // Skip home and any player-owned server (we don't want to deploy to
-  // a server we paid for with a different purpose).
-  const targets = [];
-  for (const host of seen) {
-    if (host === SOURCE) continue;
-    const s = ns.getServer(host);
-    if (!s.hasAdminRights) continue;
-    if (s.purchasedByPlayer) continue;
-    if (!s.moneyMax || s.moneyMax <= 0) continue;
-    if ((s.requiredHackingSkill ?? 0) > myHack) continue;
-    targets.push(host);
-  }
-
   // Make sure the worker script exists on home so we can scp it.
   if (!ns.fileExists(worker, SOURCE)) {
     ns.tprint(`ERROR: ${worker} not on ${SOURCE}. Push it via filesync first.`);
@@ -57,20 +42,73 @@ export async function main(ns) {
   }
 
   let deployed = 0;
-  let skipped = 0;
-  for (const host of targets) {
+  const counters = {
+    "DEPLOYED": 0,
+    "SKIP-self": 0,
+    "SKIP-purchased": 0,
+    "SKIP-nomoney": 0,
+    "SKIP-rooted": 0,
+    "SKIP-hack": 0,
+    "SKIP-running": 0,
+    "SKIP-ram": 0,
+    "FAIL-scp": 0,
+    "FAIL-exec": 0,
+  };
+
+  // Sort hosts for a stable, alphabetical status block (CSEC will always
+  // appear in the same place between runs).
+  const hosts = [...seen].sort();
+
+  for (const host of hosts) {
+    if (host === SOURCE) {
+      ns.tprint(`SKIP-self  ${host}`);
+      counters["SKIP-self"]++;
+      continue;
+    }
+
+    const s = ns.getServer(host);
+
+    if (s.purchasedByPlayer) {
+      ns.tprint(`SKIP-purchased  ${host}`);
+      counters["SKIP-purchased"]++;
+      continue;
+    }
+
+    // Check root BEFORE money: getServer() hides moneyMax on unrooted
+    // hosts, so an unrooted server with $0 would otherwise look like a
+    // nomoney server and get the wrong status line.
+    if (!s.hasAdminRights) {
+      const req = ns.getServerNumPortsRequired(host);
+      const reqHack = ns.getServerRequiredHackingLevel(host);
+      ns.tprint(`SKIP-rooted     ${host}  (need ${req} port-opener, hack ${reqHack}/${myHack})`);
+      counters["SKIP-rooted"]++;
+      continue;
+    }
+
+    if (!s.moneyMax || s.moneyMax <= 0) {
+      ns.tprint(`SKIP-nomoney    ${host}  (moneyMax=0 — faction/backdoor server, no cash to steal)`);
+      counters["SKIP-nomoney"]++;
+      continue;
+    }
+
+    if ((s.requiredHackingSkill ?? 0) > myHack) {
+      ns.tprint(`SKIP-hack       ${host}  (need hack ${s.requiredHackingSkill}, have ${myHack})`);
+      counters["SKIP-hack"]++;
+      continue;
+    }
+
     // If a copy of the worker is already running on the host, leave it
     // alone. This makes deploy.js safe to re-run.
-    const running = ns.ps(host).some((p) => p.filename === worker);
-    if (running) {
-      ns.tprint(`SKIP ${host} (${worker} already running)`);
-      skipped++;
+    if (ns.ps(host).some((p) => p.filename === worker)) {
+      ns.tprint(`SKIP-running    ${host}  (${worker} already running)`);
+      counters["SKIP-running"]++;
       continue;
     }
 
     // Copy the worker script to the target.
     if (!ns.scp(worker, host, SOURCE)) {
-      ns.tprint(`FAIL  ${host} (scp failed)`);
+      ns.tprint(`FAIL-scp        ${host}`);
+      counters["FAIL-scp"]++;
       continue;
     }
 
@@ -79,8 +117,9 @@ export async function main(ns) {
     const free = ns.getServerMaxRam(host) - ns.getServerUsedRam(host);
     const threads = Math.max(1, Math.floor(free / ramPerThread));
 
-    if (threads < 1) {
-      ns.tprint(`FAIL  ${host} (no free RAM: ${free.toFixed(2)} GB)`);
+    if (threads < 1 || ramPerThread <= 0) {
+      ns.tprint(`SKIP-ram        ${host}  (no free RAM: ${free.toFixed(2)} GB, ${worker} needs ${ramPerThread.toFixed(2)} GB)`);
+      counters["SKIP-ram"]++;
       continue;
     }
 
@@ -90,15 +129,21 @@ export async function main(ns) {
     // single hardcoded target if you want a "swarm" all hitting one.
     const pid = ns.exec(worker, host, threads, host);
     if (pid === 0) {
-      ns.tprint(`FAIL  ${host} (exec returned 0)`);
+      ns.tprint(`FAIL-exec       ${host}  (exec returned 0 — RAM contention or other script running)`);
+      counters["FAIL-exec"]++;
       continue;
     }
 
-    ns.tprint(`OK    ${host}: ${worker} x${threads} (pid ${pid})`);
-    deployed++;
+    ns.tprint(`DEPLOYED        ${host}  ${worker} x${threads} (pid ${pid})`);
+    counters["DEPLOYED"]++;
   }
 
-  ns.tprint(`done: deployed=${deployed} skipped=${skipped} targets=${targets.length}`);
+  // Summary line — easier than scanning the block.
+  const summary = Object.entries(counters)
+    .filter(([_, v]) => v > 0)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+  ns.tprint(`done: ${summary} (scanned ${hosts.length} hosts)`);
   // Auto-restart every 5 minutes so newly-nuked servers get workers too.
   // ns.exec(...) on a server that already has the worker running is
   // skipped by the check above, so this is safe.
