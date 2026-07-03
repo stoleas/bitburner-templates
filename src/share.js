@@ -19,21 +19,29 @@
 //   2. ns.share() uses the SCRIPT's full thread count as the share-
 //      power contribution. So we always run it at max threads.
 //
-// So this script does two things in parallel:
+// So this script does two things in one shot:
 //
-//   A. On home, it loops ns.share() every 9 seconds (just under the
-//      10s window) at the maximum thread count that fits.
+//   A. On home, it spawns a child share.js copy at the maximum thread
+//      count that fits. The child loops ns.share() every 9 seconds
+//      (just under the 10s window) and keeps running after this
+//      orchestrator exits.
 //
 //   B. It fans a copy of itself out to every rooted, non-purchased-
 //      server-with-some-RAM, BFS-reachable host — same shape as
 //      deploy.js. Each copy then runs (A) on its own host, contributing
 //      that host's free RAM to the global share-power pool.
 //
+// This is a ONE-SHOT script. The orchestrator exits after fan-out;
+// each spawned child keeps sharing indefinitely. Pass --loop to
+// keep the orchestrator alive and re-fan-out every 5 minutes
+// (useful when actively nuking new servers).
+//
 // Usage:
-//   run share.js                 # start the daemon (one-shot; auto-loops), QUIET by default
-//   run share.js --once          # fan out + share once, then exit (full output)
+//   run share.js                 # one-shot: fan out, spawn home child, exit (default)
+//   run share.js --loop          # keep the orchestrator alive; re-fan-out every 5 min
+//   run share.js --once          # alias for the default; explicit one-shot
 //   run share.js --verbose       # re-enable per-host SKIP / FAIL / SHARED lines
-//   run share.js --quiet         # (alias for the default; suppress per-cycle and per-host prints)
+//   run share.js --quiet         # (alias for the default; suppress per-host prints)
 //
 // RAM cost: ns.share() = 2.4 GB per call. We run with as many threads
 // as fit, so on home (32 GB default-ish in early game) the script uses
@@ -43,8 +51,9 @@
 //
 // The fan-out is idempotent: re-running share.js is safe. Servers that
 // already have a running copy are skipped. The BFS only walks the
-// network you can reach; newly-nuked hosts are picked up on the next
-// fan-out (every SHARE_RESCAN_MS).
+// network you can reach; in --loop mode, newly-nuked hosts are picked
+// up on the next re-fan-out (every SHARE_RESCAN_MS). In the default
+// one-shot mode, re-run the script manually to pick up new roots.
 //
 // Why fan out to non-purchased servers too? Rooted non-purchased
 // servers usually have very little RAM (8–32 GB), and most of it is
@@ -55,10 +64,11 @@
 // by setting SHARE_INCLUDE_PURCHASED_ONLY=true at the top of the file.
 //
 const USAGE = `Usage:
-  run share.js                 # start the daemon (one-shot; auto-loops), QUIET by default
-  run share.js --once          # fan out + share once with full output, then exit
+  run share.js                 # one-shot: fan out, spawn home child, exit (default)
+  run share.js --loop          # keep the orchestrator alive; re-fan-out every 5 min
+  run share.js --once          # alias for the default; explicit one-shot
   run share.js --verbose       # re-enable per-host SKIP / FAIL / SHARED lines
-  run share.js --quiet         # (alias for the default; suppress per-cycle and per-host prints)
+  run share.js --quiet         # (alias for the default; suppress per-host prints)
 `;
 
 const SHARE_RAM_COST = 2.4;     // ns.share()'s RAM cost per call
@@ -191,12 +201,12 @@ export async function main(ns) {
     return;
   }
   const args = (ns.args || []).map(String);
-  const once = args.includes("--once");
+  const loop = args.includes("--loop");
   const verbose = args.includes("--verbose");
-  // Default quiet for the daemon loop. --once is the diagnostic path
-  // and always prints full output. If the user passes both --quiet
-  // and --verbose, --quiet wins (they explicitly asked for it).
-  const quiet = args.includes("--quiet") || (!verbose && !once);
+  // Default quiet: suppress per-host SKIP/FAIL lines (SHARED is always
+  // printed). --loop opts into the daemon mode that re-fans-out every
+  // 5 min; --once is an explicit alias for the default one-shot.
+  const quiet = args.includes("--quiet") || !verbose;
   const child = args.includes("--child");
 
   // Child mode: just run the share loop on this host. Never recurse
@@ -250,54 +260,48 @@ export async function main(ns) {
     counters["SKIP-ram"]++;
   }
 
+  // One-shot by default. The fan-out already spawned a child share
+  // copy on each eligible host (including home); those children keep
+  // running after this orchestrator exits and maintain the share-power
+  // window indefinitely. So the orchestrator can just print a summary
+  // and exit.
   const summary = Object.entries(counters)
     .filter(([_, v]) => v > 0)
     .map(([k, v]) => `${k}=${v}`)
     .join(" ");
 
-  if (once) {
-    // Fan-out only: the spawned child share copies keep sharing after
-    // this orchestrator exits. Each child runs in its own process, so
-    // no NS-runtime contention with the parent.
-    ns.tprint(`done (--once): ${summary || "no changes"} (scanned ${hosts.length} hosts)`);
+  if (!loop) {
+    ns.tprint(`done: ${summary || "no changes"} (scanned ${hosts.length} hosts); children keep sharing, orchestrator exiting`);
     return;
   }
 
-  // The orchestrator process is now NS-idle on home. Home's share
-  // contribution comes from the --child share copy spawned on home
-  // explicitly above. This split is mandatory: keeping a
-  // runShareLoop() in this process alongside the rescan ns.sleep()
-  // triggers the "Concurrent calls to Netscript functions" runtime
-  // error.
-  // Default: stay alive and re-fan-out every SHARE_RESCAN_MS, so
+  // --loop mode: stay alive and re-fan-out every SHARE_RESCAN_MS so
   // newly-nuked hosts pick up a share copy without manual intervention.
   // ns.exec on a server that already has a share copy is a no-op
-  // (SKIP-running), so this is safe.
-  // The per-cycle ns.print() in runShareLoop is also gated on !quiet
-  // (see runShareLoop). So in quiet mode the only output during a
-  // rescan is the summary line (and only if something actually changed).
-  if (verbose) ns.tprint(`share: started, output=verbose, rescan=${SHARE_RESCAN_MS}ms`);
+  // (SKIP-running), so this is safe. Use this when actively grinding
+  // new ports — the default one-shot mode is what you want for steady
+  // state.
+  if (verbose) ns.tprint(`share: --loop, output=verbose, rescan=${SHARE_RESCAN_MS}ms`);
   let lastRescan = Date.now();
   while (true) {
     await ns.sleep(60_000);
     if (Date.now() - lastRescan >= SHARE_RESCAN_MS) {
       const next = findShareHosts(ns);
-      const nextSet = new Set(next);
       // Reset counters for the diff print; cumulative isn't useful here.
       for (const k of Object.keys(counters)) counters[k] = 0;
       fanOut(ns, next, counters, { verbose });
-      const summary = Object.entries(counters)
+      const loopSummary = Object.entries(counters)
         .filter(([_, v]) => v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(" ");
-      if (summary) {
+      if (loopSummary) {
         // In quiet mode, suppress the re-scan line when no new share
         // copy was actually spawned (SHARED=0). The "interesting"
         // event is a new share.js child starting; SKIP/FAIL on
         // already-running or RAM-contended hosts is noise. In verbose
         // mode, print the summary regardless.
         if (verbose || counters.SHARED > 0) {
-          ns.tprint(`share: re-scan ${next.length} host(s) — ${summary}`);
+          ns.tprint(`share: re-scan ${next.length} host(s) — ${loopSummary}`);
         }
       }
       lastRescan = Date.now();

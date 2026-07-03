@@ -70,7 +70,7 @@ const USAGE = `Usage:
 // automatically.
 //
 // Per the spec: bootstrap = L50, 8GB, 2 cores. sweet-spot = L100-150,
-// 16-32GB, 4 cores. We pick the MIDDLE of the "100-150" range (100)
+// 16-32GB, 4 cores. We pick the UPPER end of the "100-150" range (150)
 // and the UPPER end of the RAM ranges (32GB) so each upgrade is
 // meaningful and we don't burn money climbing a level just to drop
 // the same wallet on the next node.
@@ -81,7 +81,7 @@ const USAGE = `Usage:
 // up to 64GB. The game hard-caps Hacknet Node RAM at 64GB.
 const TIERS = [
   { name: "bootstrap",  minNodes: 0,  maxNodes: 8,  level: 50,  ramGB: 8,  cores: 2 },
-  { name: "sweet-spot", minNodes: 8,  maxNodes: 20, level: 100, ramGB: 64, cores: 4 },
+  { name: "sweet-spot", minNodes: 8,  maxNodes: 20, level: 150, ramGB: 64, cores: 4 },
   { name: "soft-cap",   minNodes: 20, maxNodes: 30, level: 150, ramGB: 64, cores: 4 },
 ];
 

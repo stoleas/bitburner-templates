@@ -27,15 +27,15 @@
 //   run monitor-backdoor.js                       # one full table on startup, then poll, QUIET (default)
 //   run monitor-backdoor.js --once                # print once, exit (full output)
 //   run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
-//   run monitor-backdoor.js --show-path           # print full home→host path on separate lines
+//   run monitor-backdoor.js --no-path             # suppress the home→host path block (off by default)
 //   run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
 //
 const USAGE = `Usage:
-  run monitor-backdoor.js                       # one full table on startup, then poll, QUIET (default)
-  run monitor-backdoor.js --once                # print once and exit (full output)
-  run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
-  run monitor-backdoor.js --show-path           # print full home→host path on separate lines
-  run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
+ run monitor-backdoor.js                       # one full table on startup, then poll, QUIET (default)
+ run monitor-backdoor.js --once                # print once and exit (full output)
+ run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
+ run monitor-backdoor.js --no-path             # suppress the home→host path block (off by default)
+ run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
 `;
 // Bitburner requires you to walk the path one hop at a time. The READY
 // line includes the `connect <a>; connect <b>; ...; backdoor` chain
@@ -65,7 +65,11 @@ export async function main(ns) {
   const args = (ns.args || []).map(String);
   const once = args.includes("--once");
   const includeBackdoored = args.includes("--include-backdoored");
-  const showPath = args.includes("--show-path");
+  // Default ON: show the home→host path + copy-paste chain. Pass
+  // --no-path to suppress (useful when running on a long-lived monitor
+  // where every change would otherwise re-print a 6-line block per
+  // server). This is the inverse of the old --show-path flag.
+  const showPath = !args.includes("--no-path");
   // Default quiet: change prints only fire when a new READY server
   // appeared. --verbose opts back into all state-change prints. --once
   // always prints full (it's a diagnostic run).
@@ -106,15 +110,16 @@ export async function main(ns) {
     return path.reverse();
   }
 
-  // Format a connect chain as a copy-paste-able command.
+  // Format a connect chain as a copy-paste-able command body.
   // Path of length 1 (just `home` itself) returns "".
-  // Path of length 2+ returns "home; connect a; connect b".
-  // (We always start at home; the game resets your terminal to home
-  // when you open it, so you don't need to `connect home` first.)
+  // Path of length 2+ returns "connect a; connect b".
+  // (We don't include `home;` because the terminal prompt already
+  // shows `[home /]>` — the user pastes the whole one-liner under
+  // the prompt and Bitburner executes it from the current shell.)
   function connectChain(path) {
     if (!path || path.length <= 1) return "";
     const hops = path.slice(1).map((h) => `connect ${h}`).join("; ");
-    return `home; ${hops}`;
+    return hops;
   }
 
   // Get a per-server status line. Returns null if the server is
@@ -198,20 +203,19 @@ export async function main(ns) {
         const path = pathTo(parent, h);
         const chain = connectChain(path);
         if (showPath) {
+          // Show the path as a single-line arrow chain (readable,
+          // copy-pasteable for the chat-prompt format), then the
+          // actual terminal one-liner beneath it. The bitburner
+          // terminal accepts `; `-chained commands separated by
+          // spaces, so the user can copy-paste the second line
+          // straight into the terminal.
           lines.push(`  READY        ${h}`);
           lines.push(`                  path: ${path.join(" → ")}`);
-          lines.push(`                  chain (one per terminal line):`);
-          // Print each hop on its own line so it's clear that the
-          // user types these one at a time, not as a single
-          // paste-and-run. The Bitburner terminal doesn't accept
-          // semicolon-chained commands; this is a checklist.
-          lines.push(`                    home`);
-          for (const hop of path.slice(1)) lines.push(`                    connect ${hop}`);
-          lines.push(`                    backdoor`);
+          lines.push(`                  [home /]> ${chain} ; backdoor`);
         } else {
           // Compact: include the chain as a comment so it's clear
           // these are sequential terminal commands, not chained.
-          lines.push(`  READY        ${h}  →  home; connect <...>; backdoor (one per line, see --show-path)`);
+          lines.push(`  READY        ${h}  →  connect <...>; backdoor (one per line, see default path block)`);
         }
       } else if (isDone) {
         counters.DONE++;
