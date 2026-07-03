@@ -63,7 +63,7 @@ const GYM = {
       return;
     }
     const targetCity = cityOf[loc];
-    if (ns.singularity.getCurrentCity() !== targetCity) {
+    if (ns.getPlayer().city !== targetCity) {
       ns.singularity.travelToCity(targetCity);
     }
   }
