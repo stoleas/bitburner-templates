@@ -291,7 +291,14 @@ export async function main(ns) {
         .map(([k, v]) => `${k}=${v}`)
         .join(" ");
       if (summary) {
-        ns.tprint(`share: re-scan ${next.length} host(s) — ${summary}`);
+        // In quiet mode, suppress the re-scan line when no new share
+        // copy was actually spawned (SHARED=0). The "interesting"
+        // event is a new share.js child starting; SKIP/FAIL on
+        // already-running or RAM-contended hosts is noise. In verbose
+        // mode, print the summary regardless.
+        if (verbose || counters.SHARED > 0) {
+          ns.tprint(`share: re-scan ${next.length} host(s) — ${summary}`);
+        }
       }
       lastRescan = Date.now();
     }

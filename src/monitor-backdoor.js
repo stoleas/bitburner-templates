@@ -18,12 +18,25 @@
 // backdoored, or a new server becomes reachable), so a long-running
 // monitor doesn't spam your terminal.
 //
+// Output defaults to QUIET — change prints are suppressed unless a
+// new READY server appeared (the actionable event). Pass --verbose
+// to see every state change. --once prints the full table once and
+// exits, ignoring the quiet default (it's a diagnostic run).
+//
 // Usage:
-//   run monitor-backdoor.js                       # one full table on startup, then poll
-//   run monitor-backdoor.js --once                # print once, exit
+//   run monitor-backdoor.js                       # one full table on startup, then poll, QUIET (default)
+//   run monitor-backdoor.js --once                # print once, exit (full output)
 //   run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
 //   run monitor-backdoor.js --show-path           # print full home→host path on separate lines
+//   run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
 //
+const USAGE = `Usage:
+  run monitor-backdoor.js                       # one full table on startup, then poll, QUIET (default)
+  run monitor-backdoor.js --once                # print once and exit (full output)
+  run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
+  run monitor-backdoor.js --show-path           # print full home→host path on separate lines
+  run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
+`;
 // Bitburner requires you to walk the path one hop at a time. The READY
 // line includes the `connect <a>; connect <b>; ...; backdoor` chain
 // you can copy-paste directly into the terminal.
@@ -37,12 +50,6 @@
 // Note: this script does NOT need to be running for backdoors to work.
 // It's purely a "what's the state of my network" panel. Idempotent.
 //
-const USAGE = `Usage:
-  run monitor-backdoor.js                       # one full table on startup, then poll
-  run monitor-backdoor.js --once                # print once, exit
-  run monitor-backdoor.js --include-backdoored  # also list backdoored servers in the table
-  run monitor-backdoor.js --show-path           # print full home→host path on separate lines
-`;
 
 const POLL_MS = 30_000;
 
@@ -59,6 +66,10 @@ export async function main(ns) {
   const once = args.includes("--once");
   const includeBackdoored = args.includes("--include-backdoored");
   const showPath = args.includes("--show-path");
+  // Default quiet: change prints only fire when a new READY server
+  // appeared. --verbose opts back into all state-change prints. --once
+  // always prints full (it's a diagnostic run).
+  const verbose = args.includes("--verbose");
 
   // BFS the reachable network. We also build a `parent` map so we
   // can reconstruct the path from home to any host — useful for
@@ -228,15 +239,24 @@ export async function main(ns) {
   // BLOCK-hack → READY (player levels up and a server becomes
   // backdoorable) or READY → DONE (player just backdoored a server).
   // The print function still filters to READY-only output.
+  //
+  // In quiet mode (the default), we suppress the change print when
+  // the new snapshot still has READY=0 — the "interesting" event is
+  // a new backdoorable server appearing, not incidental BLOCK-hack
+  // status-line churn. --verbose opts back into all state changes.
   function fullSnapshot() {
     const me = ns.getPlayer().skills.hacking;
     const { seen, parent } = bfsFromHome();
     const m = new Map();
+    let readyCount = 0;
     for (const h of seen) {
       const l = statusOf(h, me);
-      if (l) m.set(h, l);
+      if (l) {
+        m.set(h, l);
+        if (l.startsWith("READY")) readyCount++;
+      }
     }
-    return { status: m, parent };
+    return { status: m, parent, readyCount };
   }
 
   // Initial table.
@@ -255,8 +275,18 @@ export async function main(ns) {
       }
     }
     if (changed) {
-      last = next;
-      printTable("change", next.parent);
+      // In quiet mode, only re-print when the new snapshot has a
+      // READY server. Otherwise the change is just incidental
+      // BLOCK-hack churn that the user already knows about.
+      if (verbose || next.readyCount > 0) {
+        last = next;
+        printTable("change", next.parent);
+      } else {
+        // Update last so we don't keep firing on the same no-op
+        // change. Without this, every poll would re-detect the
+        // churn and the gate would re-evaluate.
+        last = next;
+      }
     }
   }
 }
