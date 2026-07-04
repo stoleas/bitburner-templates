@@ -1,8 +1,14 @@
-/** @param {NS} ns */
 // src/lib/hwgw.js
 // Pure-math helpers for HWGW batching. No side effects, no ns.* mutation.
 // Safe to import from both runtime scripts and node test scripts.
 import { NS } from "@ns";
+
+// Small buffer subtracted from arrivalT so a script that nominally
+// finishes at T doesn't fire 0ms before the next operation lands.
+// Bitburner's runtimes are deterministic but the 50ms headroom keeps
+// HWGW timing robust under minor jank. The math is also clamped to 0
+// below so a future fast target can't produce negative delayMs.
+const LANE_BUFFER_MS = 50;
 
 /**
  * Pull the per-target timing + state we need to plan a batch.
@@ -22,8 +28,6 @@ export function analyze(ns, target) {
     moneyMax: s.moneyMax,
     minSec: s.minDifficulty,
     curSec: s.hackDifficulty,
-    hackAnalyze: ns.hackAnalyze,        // bound function
-    growthAnalyze: ns.growthAnalyze,    // bound, 1 thread
   };
 }
 
@@ -48,26 +52,29 @@ export function planBatch(ns, target, opts) {
   const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, a.moneyMax, 1)));
 
   // Weaken threads: cancel hackSec and growSec. Both weakens are sized
-  // to the larger of the two so either spike is fully covered.
+  // to the larger of the two so either spike is fully covered. The two
+  // weaken slots in the batch are always equal, so we compute once.
   const weakenPerThread = ns.weakenAnalyze(1, target);
   const weakenForHack = Math.ceil((a.hackSec * hackThreads) / weakenPerThread);
   const weakenForGrow = Math.ceil((a.growSec * growThreads) / weakenPerThread);
-  const weakenThreads1 = Math.max(weakenForHack, weakenForGrow);
-  const weakenThreads2 = Math.max(weakenForHack, weakenForGrow);
+  const weakenThreads = Math.max(weakenForHack, weakenForGrow);
 
-  // Arrive at T = weakenTime - 50 (small buffer keeps the script from
-  // finishing early). Each job's delay is set so its own runtime carries
-  // it to T.
-  const arrivalT = a.weakenTime - 50;
+  // Arrive at T = weakenTime - LANE_BUFFER_MS. Each job's delay is set
+  // so its own runtime carries it to T. Math.max(0, ...) guards against
+  // a hypothetical future target whose runtime is below the buffer.
+  const arrivalT = a.weakenTime - LANE_BUFFER_MS;
+  const delay = (scriptTime) => Math.max(0, arrivalT - scriptTime);
 
   const jobs = [
-    { script: "hack.js",   threads: hackThreads,    delayMs: arrivalT - a.hackTime   },
-    { script: "weaken.js", threads: weakenThreads1, delayMs: arrivalT - a.weakenTime },
-    { script: "grow.js",   threads: growThreads,    delayMs: arrivalT - a.growTime   },
-    { script: "weaken.js", threads: weakenThreads2, delayMs: arrivalT - a.weakenTime },
+    { script: "hack.js",   threads: hackThreads,   delayMs: delay(a.hackTime)   },
+    { script: "weaken.js", threads: weakenThreads, delayMs: delay(a.weakenTime) },
+    { script: "grow.js",   threads: growThreads,   delayMs: delay(a.growTime)   },
+    { script: "weaken.js", threads: weakenThreads, delayMs: delay(a.weakenTime) },
   ];
 
-  // RAM cost (querying from "home" — the orchestrator's home of record).
+  // RAM cost: queried from "home" because the three worker scripts are
+  // pure single-op workers with identical RAM on every host. If they
+  // ever diverge in cost across hosts, this needs to be per-worker.
   const ramByScript = {
     "hack.js": ns.getScriptRam("hack.js", "home"),
     "weaken.js": ns.getScriptRam("weaken.js", "home"),
@@ -80,7 +87,7 @@ export function planBatch(ns, target, opts) {
     arrivalT,
     jobs,
     totalRam,
-    summary: `target=${target} hack=${hackThreads} w1=${weakenThreads1} grow=${growThreads} w2=${weakenThreads2} ram=${totalRam.toFixed(1)}GB`,
+    summary: `target=${target} hack=${hackThreads} w=${weakenThreads} grow=${growThreads} ram=${totalRam.toFixed(1)}GB`,
   };
 }
 
