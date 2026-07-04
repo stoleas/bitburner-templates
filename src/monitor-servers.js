@@ -163,6 +163,22 @@ export async function main(ns) {
     return Math.min(r, MAX_RAM);
   }
 
+  // Push worker scripts to a freshly-purchased pserv. The runtime
+  // requires the script to be on the target host for ns.exec to
+  // succeed — without this, every exec to a new pserv fails with
+  // "Script weaken.js does not exist on pserv-N". We push the
+  // three worker scripts the manager needs. manager.js itself
+  // lives on home so doesn't need to be pushed.
+  //
+  // Failure here is non-fatal: the next monitor-servers tick (or
+  // a manual `run sync-all.js`) will retry. The pserv might be
+  // briefly unable to host workers; the manager will SKIP-ram
+  // and try another worker in the meantime.
+  function pushWorkerScripts(host) {
+    const scripts = ["hack.js", "weaken.js", "grow.js"];
+    return ns.scp(scripts, host, SOURCE);
+  }
+
   // Cost of scaling a server from `currentGB` to 2× currentGB.
   // deleteServer + purchaseServer (the API has no in-place upgrade).
   function costOfDouble(currentGB) {
@@ -218,6 +234,13 @@ export async function main(ns) {
             // in quiet mode. Matches monitor-hacknet's NODE-BOUGHT
             // behavior.
             ns.tprint(`PSERV-BOUGHT    ${result} ${tier.targetGB}GB for $${cost.toLocaleString()} (now ${count + 1}/${MAX_ROSTER})`);
+            // Push the worker scripts so the manager can exec to
+            // this new server. Without this, the new pserv sits
+            // empty until the next manual `run sync-all.js`.
+            if (!pushWorkerScripts(result)) {
+              counters["FAIL-scp"] = (counters["FAIL-scp"] || 0) + 1;
+              if (verbose) ns.tprint(`FAIL-scp        ${result} (couldn't push worker scripts)`);
+            }
           } else {
             // purchaseServer returns "" on the cap or some other
             // race. We pre-checked the cap, so this is unusual.
@@ -310,6 +333,14 @@ export async function main(ns) {
         break;
       }
       counters["SCALED"]++;
+      // Push worker scripts to the re-purchased (scaled) server.
+      // Same reasoning as PSERV-BOUGHT — the delete+recreate wipes
+      // the file system on the pserv, so workers can't run on it
+      // until we re-scp them.
+      if (!pushWorkerScripts(result)) {
+        counters["FAIL-scp"] = (counters["FAIL-scp"] || 0) + 1;
+        if (verbose) ns.tprint(`FAIL-scp        ${result} (couldn't push worker scripts after scale)`);
+      }
       if (verbose) {
         ns.tprint(`SCALED          ${result}  ${currentGB}GB → ${newGB}GB for $${bestCost.toLocaleString()}`);
       }
@@ -320,7 +351,7 @@ export async function main(ns) {
         .filter(([, v]) => v > 0)
         .map(([k, v]) => `${k}=${v}`)
         .join(" ");
-      const interesting = counters["PSERV-BOUGHT"] > 0 || counters["SCALED"] > 0 || counters["FAIL-purchaseServer"] > 0 || counters["FAIL-deleteServer"] > 0 || counters["FAIL-purchaseAfterDelete"] > 0;
+      const interesting = counters["PSERV-BOUGHT"] > 0 || counters["SCALED"] > 0 || counters["FAIL-purchaseServer"] > 0 || counters["FAIL-deleteServer"] > 0 || counters["FAIL-purchaseAfterDelete"] > 0 || counters["FAIL-scp"] > 0;
       if (once || interesting) {
         ns.tprint(`done: ${summary || "no changes"}`);
       }

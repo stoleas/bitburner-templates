@@ -44,9 +44,19 @@
 //   monitor-nuke.js       (60s, no args)
 //   monitor-hacknet.js    (60s, no args)
 //   monitor-buy.js        (30s, no args)
-//   monitor-sync.js       (30s, no args)  — re-runs sync-all.js so filesync edits reach the fleet
 //   monitor-servers.js    (60s, no args)  — fills the pserv fleet in lockstep with wallet
 //   manager.js            (60s, no args)  — HWGW orchestrator that USES the fleet
+//
+// NOTE: monitor-sync.js is intentionally NOT in this list. The 30s
+// auto-loop that re-runs sync-all.js across the whole reachable
+// network produces a wall of SKIP-no-root / SYNCED lines per tick,
+// which drowns out manager.js's per-tick state transitions. Run
+// `sync-all.js` manually after a filesync edit (`run sync-all.js`),
+// or `run monitor-sync.js --once` for a one-shot with full output,
+// when you actually need it. The filesync dev server (nginx in the
+// podman container) is the real-time path for edits to home; the
+// 30s re-run was a safety net for state drift and isn't worth
+// the terminal noise while you're still tuning the orchestrator.
 //
 // NOTE: monitor-deploy.js is intentionally NOT in this list at
 // mid-game scale. The per-server hack-loop.js fan-out that
@@ -79,7 +89,6 @@ const MONITORS = [
   ["monitor-nuke.js",     60_000, []],
   ["monitor-hacknet.js",  60_000, []],
   ["monitor-buy.js",      30_000, []],
-  ["monitor-sync.js",     30_000, []],
   ["monitor-servers.js",  60_000, []],
   ["manager.js",          60_000, []],
 ];

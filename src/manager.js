@@ -26,14 +26,36 @@
 //                          9 is the recommended sweet spot; more
 //                          than ~12 starts to fragment the cluster.
 //   MONEY_FRACTION       — what % of moneyMax to steal per cycle.
-//                          0.10 (10%) is the sweet spot for most
-//                          targets; raise to 0.25 for fast-regrow
-//                          servers, lower to 0.05 for slow ones.
+//                          0.50 (50%) is the mid-game sweet spot:
+//                          fewer batches per target means the
+//                          per-target cooldown (see PER_TARGET_COOLDOWN_MS)
+//                          is the dominant pacing constraint, not
+//                          the orchestrator's own loop. Steal 25%
+//                          for very fast-regrow servers, 75% for
+//                          slow ones. Pre-cooldown the value was
+//                          0.10 which produced 10 batches per
+//                          drain and (because the manager re-fired
+//                          the same target every 5s) overlap races
+//                          where the new hack hit a target whose
+//                          previous grow hadn't refilled it. That
+//                          race is what made hack.js return $0.000
+//                          on otherwise-sane targets.
 //   TICK_MS              — main loop period. 5000 (5s) is the
 //                          default; 1000 for high-throughput late
 //                          game.
 //   BATCH_INTERVAL_MS    — per-target stagger. Default 4000 (4s).
 //                          Should be < (shortest weakenTime / 2).
+//   PER_TARGET_COOLDOWN_MS — minimum time between batch launches
+//                          against the same target. Default is
+//                          the target's own weakenTime + 5s
+//                          buffer, so the previous batch has
+//                          fully landed (hack/grow/weaken all
+//                          returned and security is back at min)
+//                          before the next one fires. This is
+//                          what fixed the "$0.000 hack" symptom
+//                          where re-firing at TICK_MS cadence
+//                          hit targets whose grow was still in
+//                          flight.
 //
 // Target selection: the manager dynamically picks MAX_TARGETS servers
 // per tick rather than using a hardcoded list. The selection rule:
@@ -57,13 +79,20 @@
 import { planBatch, listWorkers, findWorkerWithRam } from "/lib/hwgw.js";
 
 const MAX_TARGETS = 9;
-const MONEY_FRACTION = 0.10;
+const MONEY_FRACTION = 0.50;
 const TICK_MS = 5_000;
 // Per-target stagger: each target's arrivalT is offset by
 // ti * BATCH_INTERVAL_MS so the regrow timers don't all bunch
 // on the same wall-clock moment. Should be much less than the
 // shortest weakenTime; 4 seconds is safe.
 const BATCH_INTERVAL_MS = 4_000;
+// Safety buffer added on top of a target's weakenTime to derive
+// the per-target cooldown. 5s covers worker overhead, ns.exec
+// scheduling jitter, and a small margin for the regrow timer to
+// start clean. The actual cooldown is per-target: weakenTime
+// varies 5x across the network (fast servers ~10s, mid-game
+// ~50-90s), so a fixed value would be wrong.
+const COOLDOWN_BUFFER_MS = 5_000;
 
 // BFS the network from home. Returns the sorted list of all
 // reachable hostnames (excluding home). Used by pickTargets() to
@@ -102,8 +131,45 @@ function pickTargets(ns) {
   return candidates.slice(0, MAX_TARGETS).map((c) => c.host);
 }
 
+// Per-target cooldown tracker. Maps hostname → wall-clock ms of the
+// last fully-launched batch against that target. We gate each tick's
+// planBatch() on this so we never re-fire a target whose previous
+// batch is still in flight. State is module-scoped: it survives
+// across ticks but is wiped on manager restart (which is correct —
+// after an aug, we WANT a fresh cycle).
+//
+// Set is keyed by hostname, not by some derived id, because pickTargets
+// gives us hostnames directly and there's no ambiguity.
+//
+// We use a Map (not a plain object) because Maps preserve insertion
+// order, which makes the per-tick debug log slightly more readable
+// when we eventually surface it. (We don't today, but it's free.)
+const lastFireMs = new Map();
+
+// Set of targets currently in recovery mode (i.e. planBatch returned
+// recoveryMode: true for them on the most recent firing). Used to
+// surface enter/leave transitions to the user via tprint. Survives
+// across ticks (parallel to lastFireMs) and is wiped on manager
+// restart, which is correct.
+const recovering = new Set();
+
 export async function main(ns) {
   ns.disableLog("sleep");
+  // getServerMaxRam and getServerUsedRam are called for EVERY
+  // worker in listWorkers() on EVERY batch dispatch (smallest-fit
+  // load-balancing — see lib/hwgw.js). With 19 workers and 4 jobs
+  // per batch, that's 19*2*4 = 152 log lines per tick, drowning out
+  // the per-tick summary and the (--verbose) cooldown detail. The
+  // values are static (max) and easily-readable (used), so disabling
+  // the log is safe and the right move.
+  ns.disableLog("getServerMaxRam");
+  ns.disableLog("getServerUsedRam");
+  // ns.scan() is called by listReachableServers() in pickTargets()
+  // — once per reachable server, per tick. With ~50 reachable
+  // servers, that's 50 `scan: returned N connections` lines per
+  // tick, drowning the terminal. The return value is structural
+  // (used for BFS), not interesting to the user.
+  ns.disableLog("scan");
   // Manager is auto-quiet by default — it runs every 60s and the
   // per-tick summary only goes to the terminal when something
   // interesting happened (a batch launched, or the target list
@@ -114,17 +180,11 @@ export async function main(ns) {
     ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms, output=verbose`);
   }
 
-  // Track the last summary string we tprint'ed. We only tprint
-  // when the summary CHANGES from a non-empty value to "" (or
-  // vice versa) — repeating the same "(no changes)" line every
-  // tick is noise, but the first tick that goes quiet is a
-  // signal (something just changed).
-  let lastSummary;
-
   while (true) {
     const tickStart = Date.now();
-    const counters = { planned: 0, launched: 0, "SKIP-ram": 0, "SKIP-root": 0, "SKIP-level": 0, "SKIP-mp": 0, "FAIL-exec": 0 };
+    const counters = { planned: 0, launched: 0, "SKIP-ram": 0, "SKIP-root": 0, "SKIP-level": 0, "SKIP-mp": 0, "SKIP-cooldown": 0, "recovery-firing": 0, "enter-recovery": 0, "leave-recovery": 0, "FAIL-exec": 0 };
     const targets = pickTargets(ns);
+    const cooldownRemaining = new Map();  // for --verbose: how many ms until each target is eligible
 
     for (let ti = 0; ti < targets.length; ti++) {
       const target = targets[ti];
@@ -134,6 +194,41 @@ export async function main(ns) {
       if (!s.hasAdminRights) { counters["SKIP-root"]++; continue; }
       if (s.requiredHackingSkill > ns.getPlayer().skills.hacking) { counters["SKIP-level"]++; continue; }
       if (!s.moneyMax || s.moneyMax <= 0) { counters["SKIP-mp"]++; continue; }
+
+      // Per-target cooldown: if we fired a batch against this
+      // target less than (weakenTime + buffer) ago, skip. The
+      // previous batch's weaken hasn't landed yet, so security
+      // is still above min and moneyAvailable is mid-regrow.
+      // Firing now means: hack.js gets $0 (the regrow is partial),
+      // the batch's planBatch is sized off stale server state, and
+      // the cluster burns threads for nothing.
+      //
+      // The cooldown is per-target because weakenTime varies 5-10x
+      // across the network. A single fixed cooldown would either
+      // be too short for the slow targets or waste cycles on the
+      // fast ones.
+      //
+      // We read the target's weakenTime from the server object
+      // directly (no need to call planBatch for the gate). If we
+      // can't read it (target disappeared between pickTargets and
+      // here), treat as on-cooldown — better safe than racing
+      // against a server we can't introspect.
+      let cooldownMs;
+      try {
+        cooldownMs = ns.getWeakenTime(target) + COOLDOWN_BUFFER_MS;
+      } catch (e) {
+        counters["SKIP-cooldown"]++;
+        continue;
+      }
+      const lastFire = lastFireMs.get(target);
+      if (typeof lastFire === "number") {
+        const elapsed = Date.now() - lastFire;
+        if (elapsed < cooldownMs) {
+          counters["SKIP-cooldown"]++;
+          if (verbose) cooldownRemaining.set(target, Math.round((cooldownMs - elapsed) / 1000));
+          continue;
+        }
+      }
 
       let plan;
       try {
@@ -180,6 +275,40 @@ export async function main(ns) {
       // Stagger the arrival by ti * BATCH_INTERVAL_MS so targets
       // don't all regrow at the same instant.
       const targetOffset = ti * BATCH_INTERVAL_MS;
+      // Count how many of this target's 4 jobs successfully
+      // launched. Only record lastFireMs[target] if ALL 4 made it
+      // — a partial batch (e.g. hack launched but weaken SKIP-ram'd)
+      // leaves the target in an inconsistent state and we should
+      // NOT push the cooldown forward, because the next tick's
+      // planBatch will see the partial-state and re-fire
+      // immediately to clean up. Recording a cooldown on a
+      // partial batch would mean the partial state lingers for
+      // a full weakenTime before re-attempt.
+      //
+      // EXCEPTION: in recovery mode, the plan has 1 job (weaken
+      // only). batchLaunched === 1 === plan.jobs.length works the
+      // same way. The cooldown still applies so we don't re-fire
+      // the recovery weaken too soon.
+      let batchLaunched = 0;
+
+      // Track recovery state per target. We only tprint on
+      // transitions (entering or leaving recovery mode) so the
+      // user sees "iron-gym: now in recovery (drift=620, 2-3
+      // batches to clear)" once, then nothing until it transitions
+      // back to normal HWGW. The current state is also visible in
+      // the per-tick summary if --verbose is set.
+      if (plan.recoveryMode) {
+        counters["recovery-firing"]++;
+        if (!recovering.has(target)) {
+          counters["enter-recovery"]++;
+          recovering.add(target);
+          ns.tprint(`manager: ${target} → RECOVERY (drift=${(s.hackDifficulty - s.minDifficulty).toFixed(0)}, ${plan.summary})`);
+        }
+      } else if (recovering.has(target)) {
+        counters["leave-recovery"]++;
+        recovering.delete(target);
+        ns.tprint(`manager: ${target} → normal HWGW (${plan.summary})`);
+      }
 
       for (const job of plan.jobs) {
         const jobDelay = job.delayMs + targetOffset;
@@ -198,7 +327,15 @@ export async function main(ns) {
         const pid = ns.exec(job.script, w, job.threads, target);
         if (pid === 0) { counters["FAIL-exec"]++; continue; }
         counters.launched++;
+        batchLaunched++;
         ns.print(`manager: ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+      }
+
+      // Only stamp the cooldown if the full batch landed.
+      // See comment above the batchLaunched declaration for why
+      // a partial batch is treated as "no batch happened".
+      if (batchLaunched === plan.jobs.length) {
+        lastFireMs.set(target, Date.now());
       }
     }
 
@@ -207,26 +344,47 @@ export async function main(ns) {
       .map(([k, v]) => `${k}=${v}`)
       .join(" ");
     const elapsed = Date.now() - tickStart;
+    // Cooldown detail string for --verbose. Lists which targets
+    // we skipped this tick because they're still on cooldown,
+    // and how many seconds remain before each becomes eligible.
+    // Cheap to compute (already in the Map from the loop), and
+    // it's the only way to verify the cooldown is actually doing
+    // its job without watching the wallet.
+    const cdDetail = verbose && cooldownRemaining.size > 0
+      ? ` cooldowns=[${[...cooldownRemaining.entries()].map(([t, s]) => `${t}:${s}s`).join(",")}]`
+      : "";
     // Per-tick log line: always goes to the in-game log so verbose
     // users can see every tick.
-    ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}`);
-    // Surface interesting state to the terminal. Track the last
-    // summary printed so we only fire when it CHANGES — otherwise
-    // a long quiet stretch of (no changes) lines floods the
-    // terminal every 5s. The user wanted "only see these messages
-    // when something positively changed"; the first time we have
-    // 0 changes is a positive signal (it just changed from N
-    // changes to 0), but the second consecutive quiet tick is
-    // not. Skip until something happens.
-    if (typeof lastSummary !== "undefined" && lastSummary === summary && (summary === "" || summary === undefined)) {
-      // Suppress repeated "(no changes)" — same quiet state.
-    } else {
-      // Either we have a non-empty summary (something happened),
-      // OR this is the first time we've gone quiet (transition
-      // from "had changes" to "quiet"). Either way, print it.
-      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes — check logs if unexpected)"}`);
+    ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}${cdDetail}`);
+    // Decide whether to surface this tick to the terminal.
+    //
+    // The user wants to see ONLY when something positively
+    // happened — a batch launched, a recovery state changed.
+    // Steady-state "all targets on cooldown" should be silent,
+    // including the first tick after an action where the summary
+    // transitions from "launched=N ..." to "SKIP-cooldown=N".
+    //
+    // Print rules:
+    //   1. launched > 0  → always print (a batch fired)
+    //   2. enter-recovery or leave-recovery > 0 → always print
+    //      (recovery state transitioned, user wants to see it)
+    //   3. otherwise → silent
+    //
+    // We do NOT print on summary-changes-to-quiet, because that's
+    // a transition from "something happened" to "nothing happening"
+    // — the opposite of what the user wants to be notified about.
+    // The change-detection logic is kept simple: just check
+    // counters, not the summary string.
+    const hadAction = counters.launched > 0
+      || counters["enter-recovery"] > 0
+      || counters["leave-recovery"] > 0;
+    if (hadAction) {
+      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes)"}`);
     }
-    lastSummary = summary;
+    // No more lastSummary tracking — we only print on real actions,
+    // never on quiet ticks. The previous version tracked lastSummary
+    // to detect "first tick of a new quiet state" which the user
+    // explicitly does not want to see printed.
 
     // Wait until the next tick boundary. We've already burned some
     // time on per-job sleeps, so the residual is small.

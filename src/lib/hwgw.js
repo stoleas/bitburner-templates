@@ -56,11 +56,50 @@ export function planBatch(ns, target, opts) {
 
   // Threads to grow from current state back to max.
   // Bitburner 3.0+ signature: growthAnalyze(host, multiplier, cores?).
-  const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, a.moneyMax, 1)));
+  //
+  // CRITICAL: the second arg is a MULTIPLICATIVE FACTOR (e.g. 2 for
+  // "grow by 2x"), NOT a dollar target. The first version of this
+  // function passed `a.moneyMax` ($1.75T for max-hardware) as the
+  // multiplier, which Bitburner interpreted as "grow by a factor of
+  // 1.75e12" — and returned 17,906 threads (the absurdly-large
+  // thread count needed to grow by 1.75e12x). Those threads
+  // (31,000+ GB of RAM) didn't fit on the cluster, the grow was
+  // silently SKIP-ram'd every batch, money never regrew, and the
+  // target became permanently depleted.
+  //
+  // The correct multiplier is `moneyMax / moneyAvailable` — "how
+  // much do we need to multiply the current state by to reach
+  // max?" Mathematically: `current * multiplier = max`, so
+  // `multiplier = max / current`. When `current = 0` (just hacked)
+  // this would be infinity, so we floor `current` at $1 to avoid
+  // divide-by-zero. (The `ns.grow` API adds $1 per thread before
+  // applying the multiplier, so the absolute-zero case is
+  // impossible anyway.)
+  const growMultiplier = a.moneyMax / Math.max(1, a.moneyAvailable);
+  const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, growMultiplier, 1)));
 
-  // Weaken threads: cancel hackSec and growSec. Both weakens are sized
-  // to the larger of the two so either spike is fully covered. The two
-  // weaken slots in the batch are always equal, so we compute once.
+  // Weaken threads: cancel hackSec and growSec, AND bring any
+  // accumulated security drift back down to min.
+  //
+  // The original formula only cancelled the *new* spike (hackSec *
+  // hackThreads + growSec * growThreads). If a previous batch left
+  // the target's security above min (because its grow was SKIP-ram'd
+  // and never ran, see the growthAnalyze fix above), the new batch
+  // preserves the drift: curSec_after = curSec_before + new_spike -
+  // new_weaken = curSec_before (modulo new spike). The next batch
+  // reads the same elevated curSec and again only cancels the new
+  // spike, so security never returns to min.
+  //
+  // The fix is to compute the total sec reduction needed to reach
+  // minSec, not just cancel the new spike:
+  //
+  //   totalSecToReduce = (curSec - minSec) + (hackSec*hackThreads) + (growSec*growThreads)
+  //   weakenThreads = ceil(totalSecToReduce / weakenPerThread)
+  //
+  // This guarantees the batch ENDS with curSec = minSec (modulo
+  // rounding), regardless of accumulated drift. The two weaken
+  // slots in the batch are always equal, so we compute once.
+  //
   // Bitburner 3.0+ signature: weakenAnalyze(threads, cores?). NO host
   // arg — the function uses the script's current context (which is the
   // calling server, NOT the target). To analyze the target's weaken
@@ -75,39 +114,113 @@ export function planBatch(ns, target, opts) {
   // as the implicit context by reading its minDifficulty separately
   // and using the absolute number from the (server-agnostic) call.
   const weakenPerThread = ns.weakenAnalyze(1);
-  const weakenForHack = Math.ceil((a.hackSec * hackThreads) / weakenPerThread);
-  const weakenForGrow = Math.ceil((a.growSec * growThreads) / weakenPerThread);
-  const weakenThreads = Math.max(weakenForHack, weakenForGrow);
+  const driftSec = Math.max(0, a.curSec - a.minSec);
+  const newSpikeSec = (a.hackSec * hackThreads) + (a.growSec * growThreads);
+  const totalSecToReduce = driftSec + newSpikeSec;
+  const weakenThreads = Math.max(1, Math.ceil(totalSecToReduce / weakenPerThread));
 
-  // Arrive at T = weakenTime - LANE_BUFFER_MS. Each job's delay is set
-  // so its own runtime carries it to T. Bitburner's ns.exec accepts
-  // negative delay (interpreted as "fire immediately"), so the weaken
-  // job's natural delay of -LANE_BUFFER_MS works as intended.
+  // --- Recovery mode ---
+  // If the full batch's RAM requirement exceeds the largest single
+  // worker's free RAM, we can't run the full HWGW. This happens when
+  // a target has accumulated so much security drift that the weaken
+  // thread count is in the thousands or tens of thousands — more than
+  // any single pserv (or even home) can hold.
+  //
+  // Example: iron-gym with curSec=630 (drift=620) needs
+  // ceil(620/0.05) = 12,400 weaken threads × 1.75 GB = 21.7 TB. The
+  // user's cluster is 15 TB. Full batch doesn't fit.
+  //
+  // Recovery mode returns a 1-job plan (weaken only, no hack/grow)
+  // sized to the LARGEST single worker's free RAM. The manager
+  // fires it like any other job. Each recovery batch drains as much
+  // of the drift as fits; over a few cycles (gated by per-target
+  // cooldown), the drift drops to a level where the full HWGW batch
+  // fits and the plan transitions back to normal automatically.
+  //
+  // The `recoveryMode: true` flag in the returned plan tells the
+  // manager this is a degrade operation. The cooldown still applies
+  // so we don't re-fire too soon. The next eligible tick re-plans
+  // against the (now lower) curSec and the cycle continues.
+  //
+  // We don't try to split a single weaken job across multiple
+  // workers (no clean API for that — ns.exec spawns a single
+  // process). Instead, we just use the largest available worker,
+  // even if it means recovery is gradual. This is correct because
+  // the cooldown prevents re-fire races during recovery.
+  const ramByScript = {
+    "hack.js": ns.getScriptRam("hack.js", "home"),
+    "weaken.js": ns.getScriptRam("weaken.js", "home"),
+    "grow.js": ns.getScriptRam("grow.js", "home"),
+  };
   const arrivalT = a.weakenTime - LANE_BUFFER_MS;
   const delay = (scriptTime) => arrivalT - scriptTime;
-
   const jobs = [
     { script: "hack.js",   threads: hackThreads,   delayMs: delay(a.hackTime)   },
     { script: "weaken.js", threads: weakenThreads, delayMs: delay(a.weakenTime) },
     { script: "grow.js",   threads: growThreads,   delayMs: delay(a.growTime)   },
     { script: "weaken.js", threads: weakenThreads, delayMs: delay(a.weakenTime) },
   ];
-
-  // RAM cost: queried from "home" because the three worker scripts are
-  // pure single-op workers with identical RAM on every host. If they
-  // ever diverge in cost across hosts, this needs to be per-worker.
-  const ramByScript = {
-    "hack.js": ns.getScriptRam("hack.js", "home"),
-    "weaken.js": ns.getScriptRam("weaken.js", "home"),
-    "grow.js": ns.getScriptRam("grow.js", "home"),
-  };
   const totalRam = jobs.reduce((sum, j) => sum + ramByScript[j.script] * j.threads, 0);
+
+  // Find the largest single worker's free RAM. listWorkers() returns
+  // ["home", "pserv-0", ...] in the order Bitburner uses. home is
+  // typically the largest, but we measure free RAM (max - used) per
+  // worker because a pserv might have a big job running. The largest
+  // free-RAM worker is the one most likely to fit a recovery batch.
+  let largestFreeRam = 0;
+  for (const w of listWorkers(ns)) {
+    const free = ns.getServerMaxRam(w) - ns.getServerUsedRam(w);
+    if (free > largestFreeRam) largestFreeRam = free;
+  }
+
+  // The full batch's bottleneck is the LARGEST single job (usually
+  // one of the two weakens). If that single job doesn't fit, we go
+  // into recovery mode. We check per-job (not total) because the
+  // manager fires each job on a different worker — total > freeRam
+  // is fine if the work is split, but a single job > largest free
+  // is a hard wall.
+  const biggestJobRam = Math.max(
+    hackThreads * ramByScript["hack.js"],
+    weakenThreads * ramByScript["weaken.js"],
+    growThreads * ramByScript["grow.js"],
+  );
+
+  if (biggestJobRam > largestFreeRam) {
+    // Recovery mode: weaken-only, sized to the largest free worker.
+    // weakenPerThread × recoverThreads = sec drop per batch.
+    // The threads must fit on `largestFreeRam` minus a 5% safety margin.
+    const safetyMargin = 0.95;
+    const recoverThreads = Math.max(
+      1,
+      Math.floor((largestFreeRam * safetyMargin) / ramByScript["weaken.js"])
+    );
+    // Reduce drift by recoverThreads * weakenPerThread per batch.
+    // With drift=620 and recoverThreads=8000 (1.4 GB free × 5% =
+    // 13.3k threads, but free RAM is more like 14 TB on a 15 TB
+    // cluster), we drain ~400 sec per batch. Two batches recover
+    // iron-gym fully.
+    const recoverJobs = [
+      { script: "weaken.js", threads: recoverThreads, delayMs: 0 },  // fire immediately
+    ];
+    const recoverTotalRam = recoverJobs.reduce(
+      (sum, j) => sum + ramByScript[j.script] * j.threads, 0
+    );
+    return {
+      target,
+      arrivalT,
+      jobs: recoverJobs,
+      totalRam: recoverTotalRam,
+      recoveryMode: true,
+      summary: `target=${target} RECOVERY drift=${driftSec.toFixed(0)} w=${recoverThreads} ram=${recoverTotalRam.toFixed(1)}GB (full batch would need ${(weakenThreads * ramByScript["weaken.js"]).toFixed(0)}GB)`,
+    };
+  }
 
   return {
     target,
     arrivalT,
     jobs,
     totalRam,
+    recoveryMode: false,
     summary: `target=${target} hack=${hackThreads} w=${weakenThreads} grow=${growThreads} ram=${totalRam.toFixed(1)}GB`,
   };
 }
