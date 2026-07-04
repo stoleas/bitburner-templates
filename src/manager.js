@@ -22,9 +22,9 @@
 //
 // Tuning:
 //
-//   TARGETS              — hardcoded target list. Add/remove freely;
-//                          the orchestrator auto-skips servers it
-//                          can't root or can't afford to batch.
+//   MAX_TARGETS           — upper bound on the per-tick target list.
+//                          9 is the recommended sweet spot; more
+//                          than ~12 starts to fragment the cluster.
 //   MONEY_FRACTION       — what % of moneyMax to steal per cycle.
 //                          0.10 (10%) is the sweet spot for most
 //                          targets; raise to 0.25 for fast-regrow
@@ -35,23 +35,28 @@
 //   BATCH_INTERVAL_MS    — per-target stagger. Default 4000 (4s).
 //                          Should be < (shortest weakenTime / 2).
 //
+// Target selection: the manager dynamically picks MAX_TARGETS servers
+// per tick rather than using a hardcoded list. The selection rule:
+//
+//   1. BFS the network from home (excludes home and pserv-*).
+//   2. Filter to: hasAdminRights && moneyMax > 0 &&
+//      requiredHackingSkill <= myHack.
+//   3. Sort by moneyMax descending.
+//   4. Take the top MAX_TARGETS.
+//
+// This auto-adapts as new servers get nuked, hack level climbs, and
+// pservs land. The previous hardcoded list of mid-game servers
+// (phantasy, omega-net, etc.) was useless early-game when most of
+// them were SKIP-root or SKIP-level, and the manager had nothing
+// to do on small servers like n00dles/foodnstuff that it should
+// also be draining.
+//
 // Usage:
 //   run manager.js
 //
 import { planBatch, listWorkers, findWorkerWithRam } from "/lib/hwgw.js";
 
-const TARGETS = [
-  "phantasy",
-  "omega-net",
-  "max-hardware",
-  "silver-helix",
-  "netlink",
-  "computek",
-  "rho-construction",
-  "catalyst",
-  "I.I.I.I",
-];
-
+const MAX_TARGETS = 9;
 const MONEY_FRACTION = 0.10;
 const TICK_MS = 5_000;
 // Per-target stagger: each target's arrivalT is offset by
@@ -60,17 +65,57 @@ const TICK_MS = 5_000;
 // shortest weakenTime; 4 seconds is safe.
 const BATCH_INTERVAL_MS = 4_000;
 
+// BFS the network from home. Returns the sorted list of all
+// reachable hostnames (excluding home). Used by pickTargets() to
+// enumerate candidates. We scan every tick because newly-nuked
+// servers should become available immediately.
+function listReachableServers(ns) {
+  const SOURCE = "home";
+  const seen = new Set([SOURCE]);
+  const queue = [SOURCE];
+  while (queue.length > 0) {
+    const h = queue.shift();
+    for (const n of ns.scan(h)) {
+      if (!seen.has(n)) { seen.add(n); queue.push(n); }
+    }
+  }
+  return [...seen].filter((h) => h !== SOURCE).sort();
+}
+
+// Pick the top MAX_TARGETS servers we can actually batch: rooted,
+// have money, and within hack level. Sorted by moneyMax descending
+// so the biggest servers get first dibs on the cluster. Purchased
+// servers (pserv-*) are excluded — they have no money to steal.
+function pickTargets(ns) {
+  const me = ns.getPlayer();
+  const myHack = me.skills.hacking;
+  const candidates = [];
+  for (const host of listReachableServers(ns)) {
+    const s = ns.getServer(host);
+    if (s.purchasedByPlayer) continue;
+    if (!s.hasAdminRights) continue;
+    if (!s.moneyMax || s.moneyMax <= 0) continue;
+    if (s.requiredHackingSkill > myHack) continue;
+    candidates.push({ host, moneyMax: s.moneyMax });
+  }
+  candidates.sort((a, b) => b.moneyMax - a.moneyMax);
+  return candidates.slice(0, MAX_TARGETS).map((c) => c.host);
+}
+
 export async function main(ns) {
   ns.disableLog("sleep");
-  ns.tprint(`manager: started, targets=[${TARGETS.join(",")}] tick=${TICK_MS}ms`);
+  ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms`);
 
   while (true) {
     const tickStart = Date.now();
     const counters = { planned: 0, launched: 0, "SKIP-ram": 0, "SKIP-root": 0, "SKIP-level": 0, "SKIP-mp": 0, "FAIL-exec": 0 };
+    const targets = pickTargets(ns);
 
-    for (let ti = 0; ti < TARGETS.length; ti++) {
-      const target = TARGETS[ti];
+    for (let ti = 0; ti < targets.length; ti++) {
+      const target = targets[ti];
       const s = ns.getServer(target);
+      // pickTargets() already filtered, but be defensive — the
+      // world can change between ticks.
       if (!s.hasAdminRights) { counters["SKIP-root"]++; continue; }
       if (s.requiredHackingSkill > ns.getPlayer().skills.hacking) { counters["SKIP-level"]++; continue; }
       if (!s.moneyMax || s.moneyMax <= 0) { counters["SKIP-mp"]++; continue; }
@@ -114,7 +159,7 @@ export async function main(ns) {
       .map(([k, v]) => `${k}=${v}`)
       .join(" ");
     const elapsed = Date.now() - tickStart;
-    ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s ${summary || "(no changes)"}`);
+    ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}`);
 
     // Wait until the next tick boundary. We've already burned some
     // time on per-job sleeps, so the residual is small.
