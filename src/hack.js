@@ -15,5 +15,10 @@ export async function main(ns) {
     ns.tprint("hack: missing target arg");
     return;
   }
+  // We deliberately do NOT wrap ns.hack in a try/catch — let any
+  // errors throw, so the manager (and the user) can see the real
+  // reason the worker died in the in-game log. If the worker
+  // runs for ~1-2s and disappears, look at the hack.js process
+  // log: it'll show the actual ns.hack failure.
   await ns.hack(target);
 }
