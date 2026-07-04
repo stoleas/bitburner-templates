@@ -288,7 +288,7 @@ export async function main(ns) {
       const targetName = `${ROSTER_PREFIX}${bestIdx}`;
       const currentGB = ns.getServerMaxRam(targetName);
       const newGB = Math.min(currentGB * 2, MAX_RAM);
-      if (!ns.deleteServer(targetName)) {
+      if (!ns.cloud.deleteServer(targetName)) {
         counters["FAIL-deleteServer"]++;
         if (verbose) {
           ns.tprint(`FAIL-deleteServer  ${targetName} (running scripts? RAM in use?)`);

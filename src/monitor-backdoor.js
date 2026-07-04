@@ -38,8 +38,9 @@ const USAGE = `Usage:
  run monitor-backdoor.js --verbose             # re-enable all state-change prints (default is quiet)
 `;
 // Bitburner requires you to walk the path one hop at a time. The READY
-// line includes the `connect <a>; connect <b>; ...; backdoor` chain
-// you can copy-paste directly into the terminal.
+// line includes the full `home ; connect <a> ; ... ; backdoor` chain
+// you can copy-paste directly into the terminal — single line, just
+// the command body, nothing else per server.
 //
 // Faction-relevant servers (in roughly unlock order):
 //   CSEC, avmnite-04, I.I.I.I, runtheNET, The-Cave, foodnstuff,
@@ -65,10 +66,10 @@ export async function main(ns) {
   const args = (ns.args || []).map(String);
   const once = args.includes("--once");
   const includeBackdoored = args.includes("--include-backdoored");
-  // Default ON: show the home→host path + copy-paste chain. Pass
-  // --no-path to suppress (useful when running on a long-lived monitor
-  // where every change would otherwise re-print a 6-line block per
-  // server). This is the inverse of the old --show-path flag.
+  // Default ON: show the full copy-paste chain in the READY line.
+  // Pass --no-path to print just the server name (useful when
+  // running on a long-lived monitor where the topology is already
+  // known). This is the inverse of the old --show-path flag.
   const showPath = !args.includes("--no-path");
   // Default quiet: change prints only fire when a new READY server
   // appeared. --verbose opts back into all state-change prints. --once
@@ -77,8 +78,8 @@ export async function main(ns) {
 
   // BFS the reachable network. We also build a `parent` map so we
   // can reconstruct the path from home to any host — useful for
-  // printing the `connect <a>; connect <b>; ...` chain for a server
-  // that's more than one hop from home.
+  // printing the `home ; connect <a> ; ... ; backdoor` chain for
+  // a server that's more than one hop from home.
   function bfsFromHome() {
     const seen = new Set(["home"]);
     const parent = new Map([["home", null]]);
@@ -111,15 +112,14 @@ export async function main(ns) {
   }
 
   // Format a connect chain as a copy-paste-able command body.
-  // Path of length 1 (just `home` itself) returns "".
-  // Path of length 2+ returns "connect a; connect b".
-  // (We don't include `home;` because the terminal prompt already
-  // shows `[home /]>` — the user pastes the whole one-liner under
-  // the prompt and Bitburner executes it from the current shell.)
+  // Always starts with `home ;` so the one-liner works regardless of
+  // the current shell. Path of length 1 (just `home` itself) returns
+  // `"home ; backdoor"`. Path of length 2+ returns
+  // `"home ; connect a ; connect b ; backdoor"`.
   function connectChain(path) {
-    if (!path || path.length <= 1) return "";
-    const hops = path.slice(1).map((h) => `connect ${h}`).join("; ");
-    return hops;
+    if (!path || path.length <= 1) return "home ; backdoor";
+    const hops = path.slice(1).map((h) => `connect ${h}`).join(" ; ");
+    return `home ; ${hops} ; backdoor`;
   }
 
   // Get a per-server status line. Returns null if the server is
@@ -179,8 +179,8 @@ export async function main(ns) {
       return `SKIP-nomoney ${host}  (no money, not a faction-trigger)`;
     }
     // Eligible! Return a structured marker so printTable can build
-    // the line with the actual `connect <a>; connect <b>; ...` path
-    // — Bitburner requires you to walk the path one hop at a time.
+    // the line with the actual `home ; connect <a> ; ...` path —
+    // Bitburner requires you to walk the path one hop at a time.
     return `READY        ${host}`;
   }
 
@@ -203,19 +203,16 @@ export async function main(ns) {
         const path = pathTo(parent, h);
         const chain = connectChain(path);
         if (showPath) {
-          // Show the path as a single-line arrow chain (readable,
-          // copy-pasteable for the chat-prompt format), then the
-          // actual terminal one-liner beneath it. The bitburner
-          // terminal accepts `; `-chained commands separated by
-          // spaces, so the user can copy-paste the second line
-          // straight into the terminal.
-          lines.push(`  READY        ${h}`);
-          lines.push(`                  path: ${path.join(" → ")}`);
-          lines.push(`                  [home /]> ${chain} ; backdoor`);
+          // Single-line copy-paste body for the terminal. The
+          // bitburner terminal accepts `; `-chained commands
+          // separated by spaces, so the user can paste the
+          // quoted chain straight in. One line per READY
+          // server — no extra context, just the command.
+          lines.push(`monitor-backdoor.js: READY: "${chain}"`);
         } else {
-          // Compact: include the chain as a comment so it's clear
-          // these are sequential terminal commands, not chained.
-          lines.push(`  READY        ${h}  →  connect <...>; backdoor (one per line, see default path block)`);
+          // Compact: just the server name, no chain. Useful for
+          // long-lived monitors that already know the topology.
+          lines.push(`monitor-backdoor.js: READY: ${h}`);
         }
       } else if (isDone) {
         counters.DONE++;
