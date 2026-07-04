@@ -123,8 +123,6 @@ export async function main(ns) {
 
   ns.disableLog("sleep");
   ns.disableLog("getServerMoneyAvailable");
-  ns.disableLog("getPurchasedServerLimit");
-  ns.disableLog("getServerMaxRam");
   ns.disableLog("scan");
 
   // --- helpers ---

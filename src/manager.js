@@ -62,8 +62,6 @@ const BATCH_INTERVAL_MS = 4_000;
 
 export async function main(ns) {
   ns.disableLog("sleep");
-  ns.disableLog("getServerMaxRam");
-  ns.disableLog("getServerUsedRam");
   ns.tprint(`manager: started, targets=[${TARGETS.join(",")}] tick=${TICK_MS}ms`);
 
   while (true) {
