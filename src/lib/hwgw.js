@@ -107,13 +107,32 @@ export function listWorkers(ns) {
 }
 
 /**
- * Find the first worker with at least `needRam` GB free.
- * Returns null if no worker has the room.
+ * Find a worker that has at least `needRam` GB of free RAM and return
+ * its name, or null if no worker qualifies.
+ *
+ * Load-balancing rule: pick the SMALLEST worker that fits. This
+ * leaves the biggest workers (typically home, with 1+ TB) free for
+ * the largest batches (which need many threads × worker RAM), and
+ * spreads smaller batches across the pserv fleet. Without this
+ * rule, `findWorkerWithRam` would always return home first (it's
+ * first in `workers` and always has free RAM), and the pservs
+ * would sit idle while home became a hot spot.
+ *
+ * We achieve "smallest fit" by tracking the minimum-max candidate
+ * on the fly. Cost is O(N) per call where N = number of workers
+ * (typically 1 + up-to-25 pservs = 26, so this is cheap — fewer
+ * than 100 simple arithmetic ops per batch).
  */
 export function findWorkerWithRam(ns, workers, needRam) {
+  let bestName = null;
+  let bestMax = Infinity;
   for (const w of workers) {
-    const free = ns.getServerMaxRam(w) - ns.getServerUsedRam(w);
-    if (free >= needRam) return w;
+    const max = ns.getServerMaxRam(w);
+    const used = ns.getServerUsedRam(w);
+    if (max - used >= needRam && max < bestMax) {
+      bestName = w;
+      bestMax = max;
+    }
   }
-  return null;
+  return bestName;
 }
