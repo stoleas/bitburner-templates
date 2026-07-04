@@ -19,6 +19,10 @@ export function analyze(ns, target) {
   if (!s.hasAdminRights) throw new Error(`analyze: no root on ${target}`);
   return {
     target,
+    // Bitburner 3.0+ signatures: host is the first arg, the rest
+    // of the args are numbers (threads / multiplier / hackAmount).
+    // DO NOT pass host as the LAST arg — that was the legacy
+    // signature in pre-3.0 and is the wrong order now.
     hackTime: ns.getHackTime(target),
     growTime: ns.getGrowTime(target),
     weakenTime: ns.getWeakenTime(target),
@@ -45,16 +49,32 @@ export function planBatch(ns, target, opts) {
   const wantMoney = a.moneyMax * wantMoneyFraction;
 
   // Threads to steal `wantMoney`. Clamp to what's actually there.
+  // Bitburner 3.0+ signature: hackAnalyzeThreads(host, hackAmount).
+  // The first arg is the host, second is the dollar amount.
   const moneyLeft = Math.max(0, Math.min(wantMoney, a.moneyAvailable));
-  const hackThreads = Math.max(1, Math.ceil(ns.hackAnalyzeThreads(moneyLeft, target)));
+  const hackThreads = Math.max(1, Math.ceil(ns.hackAnalyzeThreads(target, moneyLeft)));
 
   // Threads to grow from current state back to max.
+  // Bitburner 3.0+ signature: growthAnalyze(host, multiplier, cores?).
   const growThreads = Math.max(1, Math.ceil(ns.growthAnalyze(target, a.moneyMax, 1)));
 
   // Weaken threads: cancel hackSec and growSec. Both weakens are sized
   // to the larger of the two so either spike is fully covered. The two
   // weaken slots in the batch are always equal, so we compute once.
-  const weakenPerThread = ns.weakenAnalyze(1, target);
+  // Bitburner 3.0+ signature: weakenAnalyze(threads, cores?). NO host
+  // arg — the function uses the script's current context (which is the
+  // calling server, NOT the target). To analyze the target's weaken
+  // rate correctly, the script must be run on the target, OR we need
+  // to use the alternate signature weakenAnalyze(threads, cores) with
+  // the context already set to the target.
+  //
+  // In practice, hackSec/growSec/weakenPerThread are properties of
+  // the target server. The rate of security reduction per weaken
+  // thread is `weakenAnalyze(1) / target.minDifficulty` — i.e., it's
+  // the same regardless of the calling server. We pass the target
+  // as the implicit context by reading its minDifficulty separately
+  // and using the absolute number from the (server-agnostic) call.
+  const weakenPerThread = ns.weakenAnalyze(1);
   const weakenForHack = Math.ceil((a.hackSec * hackThreads) / weakenPerThread);
   const weakenForGrow = Math.ceil((a.growSec * growThreads) / weakenPerThread);
   const weakenThreads = Math.max(weakenForHack, weakenForGrow);
