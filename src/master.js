@@ -2,11 +2,10 @@
 //
 // master.js — "I just augmented, get me back online" launcher.
 //
-// Starts (or restarts) every long-lived monitor this repo ships, plus
-// monitor-deploy (the polling version of deploy.js) on a 30s cadence.
-// Run it once after every Augmentation and your early-game automation
-// is back in place without you having to remember the seven `run`
-// commands or the per-script PIDs.
+// Starts (or restarts) every long-lived monitor this repo ships.
+// Run it once after every Augmentation and your mid-game automation
+// is back in place without you having to remember the per-script
+// commands or PIDs.
 //
 // Idempotent: re-running is safe. If a monitor is already running, we
 // kill the old instance and start a fresh one. This means you can run
@@ -19,16 +18,15 @@
 // "is everything up?".
 //
 // Usage:
-//   run master.js                          # default cadence for everything
-//   run master.js --deploy-interval 60000  # override monitor-deploy cadence
-//   run master.js --once                    # print status, don't (re)start anything
+//   run master.js                  # default cadence for everything
+//   run master.js --once            # print status, don't (re)start anything
 //
 // Why a master and not just a static recipe in this README:
 //   Bitburner loses all running scripts on Augmentation. The recipes
-//   in BeginnersGuide.md are "after the aug, run these seven things"
-//   but actually doing that without typos is annoying. master.js
-//   encodes the recipe as code and adds the restart-on-collision
-//   behavior that makes the post-aug ritual one command.
+//   in BeginnersGuide.md are "after the aug, run these things" but
+//   actually doing that without typos is annoying. master.js encodes
+//   the recipe as code and adds the restart-on-collision behavior
+//   that makes the post-aug ritual one command.
 //
 // Why we DON'T add stat-train / crime-loop / share here:
 //   Those are personal-economy scripts, not monitors — they each
@@ -39,7 +37,7 @@
 //   background daemons that should be running 24/7".
 //
 // Files started (in this order — backdoor and nuke first so the
-// network is healthy before deploy fans workers out):
+// network is healthy before manager.js starts running HWGW batches):
 //   monitor-backdoor.js   (30s, no args)
 //   monitor-nuke.js       (60s, no args)
 //   monitor-hacknet.js    (60s, no args)
@@ -58,24 +56,25 @@
 // 30s re-run was a safety net for state drift and isn't worth
 // the terminal noise while you're still tuning the orchestrator.
 //
-// NOTE: monitor-deploy.js is intentionally NOT in this list at
-// mid-game scale. The per-server hack-loop.js fan-out that
-// monitor-deploy.js drives was the right shape for early game
-// (hack level <100, home RAM <256 GB) but is now actively HARMFUL
-// at mid-game: hack-loop.js runs ON the target server and drains
-// it on a continuous loop, so when manager.js fires a hw.js/weaken.js
-// from a pserv the target's moneyAvailable is 0 (just drained) and
-// the worker returns instantly with nothing to do. You see workers
-// appear on pservs and disappear in 1-2 seconds — that's the symptom.
+// NOTE: monitor-deploy.js (and deploy.js directly) is intentionally
+// NOT in this list at mid-game scale. The per-server hack-loop.js
+// fan-out was the right shape for early game (hack level <100,
+// home RAM <256 GB) but is now actively HARMFUL at mid-game:
+// hack-loop.js runs ON the target server and drains it on a
+// continuous loop, so when manager.js fires a hw.js/weaken.js from
+// a pserv the target's moneyAvailable is 0 (just drained) and the
+// worker returns instantly with nothing to do. If you see
+// `deploy.js: DEPLOYED ... hack-loop.js` in your terminal, that
+// means a stale `deploy.js` process is still running from an
+// earlier session — kill it with `kill <pid>` (find via `ps`).
 //
-// To re-enable monitor-deploy.js for small-server-only fan-out
-// (e.g. for the xp farm or non-batch targets), pass --target
-// filter via deploy.js itself. For now, manager.js owns the
-// whole rooted target set.
+// To re-enable deploy.js for small-server-only fan-out (e.g. for
+// the xp farm or non-batch targets), run it manually with a
+// --target filter. For now, manager.js owns the whole rooted
+// target set and no other script should be deploying workers.
 const USAGE = `Usage:
-run master.js                          # start every long-lived monitor
-run master.js --deploy-interval 60000  # override monitor-deploy poll cadence (ms)
-run master.js --once                    # print current monitor status, don't (re)start
+run master.js                  # start every long-lived monitor
+run master.js --once            # print current monitor status, don't (re)start
 `;
 
 // Each entry: [script, default-interval-ms, extra-args...]
@@ -100,21 +99,6 @@ export async function main(ns) {
   }
   ns.disableLog("sleep");
 
-  // Parse --deploy-interval <ms>. We mutate the MONITORS row for
-  // monitor-deploy.js in place so the rest of the function just
-  // walks the table.
-  const depIdx = ns.args.indexOf("--deploy-interval");
-  if (depIdx >= 0) {
-    const v = Number(ns.args[depIdx + 1]);
-    if (!Number.isFinite(v) || v <= 0) {
-      ns.tprint(`master: --deploy-interval must be a positive number (got ${ns.args[depIdx + 1]})`);
-      return;
-    }
-    // Replace the row. We keep the same shape ([name, default, args])
-    // so the loop body doesn't need a special case for deploy.
-    const row = MONITORS.find((r) => r[0] === "monitor-deploy.js");
-    row[2] = ["--interval", String(v)];
-  }
   const once = ns.args.includes("--once");
 
   // Sanity check: every script must be on home before we try to

@@ -76,7 +76,7 @@
 // Usage:
 //   run manager.js
 //
-import { planBatch, listWorkers, findWorkerWithRam } from "/lib/hwgw.js";
+import { planBatch, listWorkers, findWorkerWithRam, findLargestWorkerWithRam } from "/lib/hwgw.js";
 
 const MAX_TARGETS = 9;
 const MONEY_FRACTION = 0.50;
@@ -302,12 +302,16 @@ export async function main(ns) {
         if (!recovering.has(target)) {
           counters["enter-recovery"]++;
           recovering.add(target);
-          ns.tprint(`manager: ${target} → RECOVERY (drift=${(s.hackDifficulty - s.minDifficulty).toFixed(0)}, ${plan.summary})`);
+          // Silent — recovery transitions are now "working as
+          // expected" events. The recovery state is observable
+          // in the counters (which surface as part of the
+          // error-only tprint above when something else goes
+          // wrong) and in the per-tick ns.print (verbose mode).
         }
       } else if (recovering.has(target)) {
         counters["leave-recovery"]++;
         recovering.delete(target);
-        ns.tprint(`manager: ${target} → normal HWGW (${plan.summary})`);
+        // Silent — same reasoning as enter-recovery above.
       }
 
       for (const job of plan.jobs) {
@@ -322,13 +326,32 @@ export async function main(ns) {
         const workers = listWorkers(ns);
         const ramPerThread = ns.getScriptRam(job.script, "home");
         const need = job.threads * ramPerThread;
-        const w = findWorkerWithRam(ns, workers, need);
+        // Recovery mode uses the LARGEST fit: recovery wants to
+        // drain drift as fast as possible, so it picks the
+        // biggest free worker (typically home with 1+ TB) instead
+        // of the smallest-fit pserv (which would only get a 1.8
+        // GB worker and drain 0.05 sec per batch — would take
+        // thousands of batches to clear typical drift). For
+        // normal mode, use the regular smallest-fit rule so
+        // small batches spread across the pserv fleet.
+        const w = plan.recoveryMode
+          ? findLargestWorkerWithRam(ns, workers, need)
+          : findWorkerWithRam(ns, workers, need);
         if (!w) { counters["SKIP-ram"]++; continue; }
         const pid = ns.exec(job.script, w, job.threads, target);
         if (pid === 0) { counters["FAIL-exec"]++; continue; }
         counters.launched++;
         batchLaunched++;
-        ns.print(`manager: ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+        // Per-job trace: silent by default. Only fires under
+        // --verbose (so the in-game log file shows the per-job
+        // detail during debugging). The user explicitly does not
+        // want per-job lines on the terminal during normal
+        // operation. The success path is silent; the failure
+        // path (counters.FAIL-exec above) is captured in the
+        // error-only tprint.
+        if (verbose) {
+          ns.print(`manager: ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+        }
       }
 
       // Only stamp the cooldown if the full batch landed.
@@ -353,38 +376,68 @@ export async function main(ns) {
     const cdDetail = verbose && cooldownRemaining.size > 0
       ? ` cooldowns=[${[...cooldownRemaining.entries()].map(([t, s]) => `${t}:${s}s`).join(",")}]`
       : "";
-    // Per-tick log line: always goes to the in-game log so verbose
-    // users can see every tick.
-    ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}${cdDetail}`);
+    // Per-tick log line: only under --verbose, since this
+    // shows in the in-game terminal tail. The user wants the
+    // terminal to be silent when everything is working. The
+    // error-only tprint below handles the error case. Under
+    // --verbose, this line shows the full per-tick detail
+    // (counters, cooldowns) for debugging.
+    if (verbose) {
+      ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}${cdDetail}`);
+    }
     // Decide whether to surface this tick to the terminal.
     //
-    // The user wants to see ONLY when something positively
-    // happened — a batch launched, a recovery state changed.
-    // Steady-state "all targets on cooldown" should be silent,
-    // including the first tick after an action where the summary
-    // transitions from "launched=N ..." to "SKIP-cooldown=N".
+    // Quiet-by-default with the strictest rule: ONLY print on
+    // errors. Normal launches, recovery transitions, and
+    // SKIP-cooldown/SKIP-ram are all silent. The user wants
+    // the terminal to reflect "everything is working as
+    // expected" by being completely empty during normal
+    // operation. Anything printed is a problem worth seeing.
     //
-    // Print rules:
-    //   1. launched > 0  → always print (a batch fired)
-    //   2. enter-recovery or leave-recovery > 0 → always print
-    //      (recovery state transitioned, user wants to see it)
-    //   3. otherwise → silent
+    // What counts as an error worth printing:
+    //   - FAIL-exec > 0   (ns.exec returned 0 — script missing
+    //                       on the target host, or RAM race)
+    //   - SKIP-ram > 0    (recovery or normal batch couldn't
+    //                       find a worker with enough free RAM)
+    //   - SKIP-level > 0  (target's hack level too high — should
+    //                       not happen at this point, but a signal
+    //                       that pickTargets() is broken)
+    //   - SKIP-mp > 0     (target's money < min threshold — also
+    //                       unexpected, indicates a math bug)
+    //   - SKIP-root > 0   (target not rooted — nuke monitor is
+    //                       broken or hasn't caught up)
     //
-    // We do NOT print on summary-changes-to-quiet, because that's
-    // a transition from "something happened" to "nothing happening"
-    // — the opposite of what the user wants to be notified about.
-    // The change-detection logic is kept simple: just check
-    // counters, not the summary string.
-    const hadAction = counters.launched > 0
-      || counters["enter-recovery"] > 0
-      || counters["leave-recovery"] > 0;
-    if (hadAction) {
-      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes)"}`);
+    // What is NOT printed (silent, working as expected):
+    //   - launched > 0                (a batch fired successfully)
+    //   - enter-recovery > 0          (target entered recovery)
+    //   - leave-recovery > 0          (target left recovery)
+    //   - SKIP-cooldown > 0           (target still on cooldown)
+    //   - SKIP-ram > 0                (cluster has no room for the
+    //                                  planned batch — happens
+    //                                  every tick during recovery
+    //                                  mode when the first batch
+    //                                  consumes all the free RAM.
+    //                                  Working as expected. The
+    //                                  user explicitly does not
+    //                                  want to see this.)
+    //   - SKIP-level > 0              (would be a real bug, but
+    //                                  doesn't fire in practice)
+    //   - SKIP-mp > 0                 (would be a real bug, but
+    //                                  doesn't fire in practice)
+    //   - SKIP-root > 0               (target not rooted yet —
+    //                                  nuke.js is handling it)
+    //   - planned > 0                 (we planned a batch)
+    //
+    // Only print on actual exec failures (FAIL-exec) — those
+    // indicate a real problem (script missing on host, RAM race
+    // caught by the runtime, etc.) that the user needs to see.
+    //
+    // For per-tick visibility into the working-as-expected case,
+    // use `run manager.js --verbose` which ns.prints every tick
+    // to the in-game log file. The terminal stays clean.
+    if (counters["FAIL-exec"] > 0) {
+      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no summary)"}`);
     }
-    // No more lastSummary tracking — we only print on real actions,
-    // never on quiet ticks. The previous version tracked lastSummary
-    // to detect "first tick of a new quiet state" which the user
-    // explicitly does not want to see printed.
 
     // Wait until the next tick boundary. We've already burned some
     // time on per-job sleeps, so the residual is small.

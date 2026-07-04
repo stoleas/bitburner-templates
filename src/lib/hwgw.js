@@ -269,3 +269,51 @@ export function findWorkerWithRam(ns, workers, needRam) {
   }
   return bestName;
 }
+
+/**
+ * Find the LARGEST worker with at least `needRam` usable free RAM.
+ *
+ * Mirror image of `findWorkerWithRam`: where the smallest-fit
+ * rule spreads small batches across the pserv fleet, the
+ * largest-fit rule is used by recovery mode in `planBatch` —
+ * recovery mode wants to drain security drift as fast as
+ * possible, so it picks the biggest free worker (typically
+ * home with 1+ TB) and uses as much of its free RAM as it can.
+ *
+ * Without this helper, recovery mode would land its weaken
+ * job on whatever 1.8 GB pserv happened to be the smallest fit,
+ * draining drift at 0.05 sec per batch (would take thousands
+ * of batches to clear typical mid-game drift). With it, the
+ * recovery weaken lands on the biggest free worker and drains
+ * hundreds of sec per batch.
+ *
+ * `homeHeadroomRam` is the amount of home's free RAM to exclude
+ * from consideration. Default 32 GB. This is to leave room for
+ * `nuke.js` and other one-shot home scripts that the monitors
+ * fire (each ~5-10 GB). Without this headroom, recovery mode
+ * consumes all of home's free RAM and the next nuke.js invocation
+ * fails with "not enough RAM" until the next recovery cooldown
+ * expires. We reserve headroom only on home; pservs are
+ * unaffected (other system scripts don't run on pservs).
+ *
+ * Cost is also O(N) per call, same as findWorkerWithRam.
+ */
+export function findLargestWorkerWithRam(ns, workers, needRam, homeHeadroomRam = 32) {
+  let bestName = null;
+  let bestFree = -1;
+  for (const w of workers) {
+    const max = ns.getServerMaxRam(w);
+    const used = ns.getServerUsedRam(w);
+    // Reserve headroom on home only — system scripts (nuke.js,
+    // buy programs, etc.) run on home and need free RAM to start.
+    // Without this, recovery mode hogs all of home's free RAM
+    // and the next nuke.js invocation fails.
+    const headroom = w === "home" ? homeHeadroomRam : 0;
+    const free = max - used - headroom;
+    if (free >= needRam && free > bestFree) {
+      bestName = w;
+      bestFree = free;
+    }
+  }
+  return bestName;
+}

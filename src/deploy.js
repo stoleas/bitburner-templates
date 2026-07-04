@@ -66,10 +66,18 @@ export async function main(ns) {
     return;
   }
 
-  // Convenience: per-host printers that respect --quiet. Status-block
-  // events (DEPLOYED, SKIP-*, FAIL-*) are still aggregated into
-  // counters and printed in the summary.
+  // Quiet-by-default: only DEPLOYED and FAIL-* events are
+  // interesting per-host. SKIP-* events (rooted, hack, etc.) are
+  // expected noise during a normal run — printing them per-host
+  // floods the terminal. The final summary at the end aggregates
+  // all counter values regardless, so the user still sees how
+  // many hosts were skipped and why. DEPLOYED events are the
+  // positive signal we want surfaced; everything else is silent
+  // (matching manager.js's error-only print rule).
   const print = (line) => { if (!quiet) ns.tprint(line); };
+  // Always-print wrapper for DEPLOYED and FAIL events (no --quiet
+  // gating). SKIP events use the gated `print()` above.
+  const alert = (line) => ns.tprint(line);
 
   let deployed = 0;
   const counters = {
@@ -166,7 +174,7 @@ export async function main(ns) {
       continue;
     }
 
-    print(`DEPLOYED        ${host}  ${worker} x${threads} (pid ${pid})`);
+    alert(`DEPLOYED        ${host}  ${worker} x${threads} (pid ${pid})`);
     counters["DEPLOYED"]++;
   }
 
