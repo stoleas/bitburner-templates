@@ -114,6 +114,13 @@ export async function main(ns) {
     ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms, output=verbose`);
   }
 
+  // Track the last summary string we tprint'ed. We only tprint
+  // when the summary CHANGES from a non-empty value to "" (or
+  // vice versa) — repeating the same "(no changes)" line every
+  // tick is noise, but the first tick that goes quiet is a
+  // signal (something just changed).
+  let lastSummary;
+
   while (true) {
     const tickStart = Date.now();
     const counters = { planned: 0, launched: 0, "SKIP-ram": 0, "SKIP-root": 0, "SKIP-level": 0, "SKIP-mp": 0, "FAIL-exec": 0 };
@@ -132,7 +139,12 @@ export async function main(ns) {
       try {
         plan = planBatch(ns, target, { moneyFraction: MONEY_FRACTION });
       } catch (e) {
-        ns.print(`manager: planBatch(${target}) failed: ${e.message}`);
+        // Surface planBatch failures to the terminal so the user
+        // can see WHY batches aren't launching. Without this,
+        // the per-tick summary prints "(no changes)" and the
+        // error is buried in the in-game log.
+        counters["FAIL-plan"] = (counters["FAIL-plan"] || 0) + 1;
+        ns.tprint(`manager: planBatch(${target}) failed: ${e.message}`);
         continue;
       }
       counters.planned++;
@@ -167,19 +179,26 @@ export async function main(ns) {
       .map(([k, v]) => `${k}=${v}`)
       .join(" ");
     const elapsed = Date.now() - tickStart;
-    // Surface interesting state to the terminal. A tick with no
-    // launches is informational, not a positive change, so we
-    // only print it once per minute. The per-tick log line goes
-    // to ns.print (so the in-game log has it for /verbose users)
-    // and the terminal gets a one-line summary on ticks where
-    // something HAPPENED.
+    // Per-tick log line: always goes to the in-game log so verbose
+    // users can see every tick.
     ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}`);
-    if (counters.launched > 0 || counters.planned === 0) {
-      // Positive event (a batch launched) or zero-target (something
-      // changed in the network: every server became unreachable,
-      // or all targets are now out-of-level). Either way, surface it.
-      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes)"}`);
+    // Surface interesting state to the terminal. Track the last
+    // summary printed so we only fire when it CHANGES — otherwise
+    // a long quiet stretch of (no changes) lines floods the
+    // terminal every 5s. The user wanted "only see these messages
+    // when something positively changed"; the first time we have
+    // 0 changes is a positive signal (it just changed from N
+    // changes to 0), but the second consecutive quiet tick is
+    // not. Skip until something happens.
+    if (typeof lastSummary !== "undefined" && lastSummary === summary && (summary === "" || summary === undefined)) {
+      // Suppress repeated "(no changes)" — same quiet state.
+    } else {
+      // Either we have a non-empty summary (something happened),
+      // OR this is the first time we've gone quiet (transition
+      // from "had changes" to "quiet"). Either way, print it.
+      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes — check logs if unexpected)"}`);
     }
+    lastSummary = summary;
 
     // Wait until the next tick boundary. We've already burned some
     // time on per-job sleeps, so the residual is small.
