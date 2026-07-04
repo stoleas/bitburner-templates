@@ -98,7 +98,7 @@ export function planBatch(ns, target, opts) {
  */
 export function listWorkers(ns) {
   const out = ["home"];
-  const limit = ns.getPurchasedServerLimit();
+  const limit = ns.cloud.getServerLimit();
   for (let i = 0; i < limit; i++) {
     const name = `pserv-${i}`;
     if (ns.serverExists(name)) out.push(name);

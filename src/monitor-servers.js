@@ -17,7 +17,7 @@
 // keeps the whole fleet moving in lockstep and stops the per-server
 // cost curve (each 2× scales cost by 6×) from outpacing the wallet.
 //
-// The roster is fixed at the game's 25-server cap (getPurchasedServerLimit).
+// The roster is fixed at the game's 25-server cap (ns.cloud.getServerLimit in 3.0.0).
 // Names are pserv-0..pserv-24. We never rename — a 2× upgrade is
 // deleteServer + purchaseServer at the new size. The lost scripts
 // and tmp data on a delete is a non-issue at this stage of the game
@@ -80,7 +80,7 @@ const SOURCE = "home";
 const ROSTER_PREFIX = "pserv-";
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_NEW_SERVER_CAP = 25;     // tier guide: 25 = game cap; mid-game sweet spot is 25
-const MAX_ROSTER = 25;                 // hard cap from ns.getPurchasedServerLimit()
+const MAX_ROSTER = 25;                 // hard cap from ns.cloud.getServerLimit()
 const MAX_RAM = 2 ** 20;               // 1,048,576 GB — game hard cap
 const DEFAULT_RULE = 0.10;             // 1-to-10 Rule
 const MIN_RULE = 0.0;
@@ -139,7 +139,7 @@ export async function main(ns) {
 
   // Count of currently-existing pserv slots.
   function currentCount() {
-    const limit = ns.getPurchasedServerLimit();
+    const limit = ns.cloud.getServerLimit();
     let n = 0;
     for (let i = 0; i < limit; i++) {
       if (ns.serverExists(`${ROSTER_PREFIX}${i}`)) n++;
@@ -149,7 +149,7 @@ export async function main(ns) {
 
   // First missing slot in pserv-0..pserv-(limit-1), or -1 if all exist.
   function firstMissingSlot() {
-    const limit = ns.getPurchasedServerLimit();
+    const limit = ns.cloud.getServerLimit();
     for (let i = 0; i < limit; i++) {
       if (!ns.serverExists(`${ROSTER_PREFIX}${i}`)) return i;
     }
