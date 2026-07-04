@@ -40,16 +40,34 @@
 //   run monitor-deploy.js --once           # one deploy.js pass, full output, then exit
 //   run monitor-deploy.js --interval 15000 # loop, every 15s
 //   run monitor-deploy.js --verbose        # re-enable deploy.js per-host output
+//   run monitor-deploy.js --force          # override mid-game guard (manager.js running)
 //   run monitor-deploy.js -- hack-loop.js  # custom worker (passed to deploy.js)
 //
 // Requires deploy.js to be present on home (it normally is, via the
 // standard build pipeline).
+//
+// Mid-game refusal: mirrors deploy.js. If manager.js is running on
+// home, the centralized HWGW orchestrator already owns the rooted
+// target set. Per-server hack-loop.js fan-out at this point drains
+// moneyAvailable on a continuous loop and breaks manager.js's
+// pserv-launched ns.hack() (returns $0.000 on otherwise-sane
+// targets — Pitfall 8 in bitburner-dev: per-server and centralized
+// HWGW systems can't coexist). The wrapper refuses to launch
+// deploy.js, prints a clear actionable message, and (in loop mode)
+// re-checks every interval so killing manager.js resumes the
+// fan-out without manual restart. --force opts in for the
+// early-game case or for explicit testing. The same check is also
+// in deploy.js itself as belt-and-suspenders — running `deploy.js`
+// directly with manager.js up refuses on its own. The
+// wrapper-level check is the one that matters for the 30s loop,
+// since the child check would otherwise fire on every tick.
 //
 const USAGE = `Usage:
 run monitor-deploy.js                  # loop, every 30s, QUIET (default)
 run monitor-deploy.js --once           # one deploy.js pass with full output, then exit
 run monitor-deploy.js --interval 15000 # loop, every 15s
 run monitor-deploy.js --verbose        # loop with per-host DEPLOY/SKIP lines
+run monitor-deploy.js --force          # override mid-game guard (manager.js running)
 run monitor-deploy.js -- worker.js     # custom worker (default: hack-loop.js)
 `;
 
@@ -82,6 +100,7 @@ export async function main(ns) {
   const args = ns.args.slice();
   const once = args.includes("--once");
   const verbose = args.includes("--verbose");
+  const force = args.includes("--force");
   const intervalIdx = args.indexOf("--interval");
   const intervalMs = intervalIdx >= 0
     ? Number(args[intervalIdx + 1])
@@ -91,13 +110,56 @@ export async function main(ns) {
     return;
   }
 
+  // Mid-game guard (mirrors deploy.js): if manager.js is running on
+  // home, the centralized HWGW orchestrator already owns the rooted
+  // target set. Per-server hack-loop.js fan-out at this point
+  // drains moneyAvailable on a continuous loop and breaks
+  // manager.js's pserv-launched ns.hack() (returns $0.000 on
+  // otherwise-sane targets — Pitfall 8 in bitburner-dev). Refuse
+  // here at the wrapper level so the message prints once per
+  // 30s tick instead of bubbling up from every nested deploy.js
+  // child. --force opts in for the early-game case or for explicit
+  // testing. Note: the same check is also in deploy.js itself as
+  // belt-and-suspenders — if someone runs `deploy.js` directly
+  // while manager.js is up, deploy.js refuses on its own. This
+  // wrapper-level check is the one that matters for the
+  // monitor-deploy.js 30s loop, since the child check would
+  // otherwise fire on every tick.
+  const managerRunning = ns.ps("home").some((p) => p.filename === "manager.js");
+  if (managerRunning && !force) {
+    ns.tprint(
+      "monitor-deploy: refused — manager.js is running on home. " +
+      "The centralized HWGW orchestrator already owns the rooted target set; " +
+      "per-server hack-loop.js fan-out drains moneyAvailable and breaks " +
+      "manager.js's $X.XXX hacks (Pitfall 8 in bitburner-dev). " +
+      "Pass --force to override, or run manager.js for the centralized system."
+    );
+    // If the user passed --once, return immediately (one-shot
+    // mode). Otherwise, sleep the full interval and re-check — if
+    // manager.js is killed later, monitor-deploy.js will resume on
+    // its own without requiring a manual restart. This is the
+    // same restart-on-collision pattern master.js uses for its
+    // own MONITORS.
+    if (once) return;
+    while (managerRunning) {
+      await ns.sleep(intervalMs);
+      // Re-check on every wake. Cheap (one ns.ps() call).
+      if (!ns.ps("home").some((p) => p.filename === "manager.js")) break;
+    }
+  }
+
   // Build the deploy.js arg list: pass through everything except
-  // our own flags (--once, --interval, --verbose, --help/-h, and the
-  // value after --interval). deploy.js doesn't know about those.
-  // We ADD --quiet by default so the 30s loop doesn't flood the
-  // terminal — --verbose opts out, --once always wants full output.
+  // our own flags (--once, --interval, --verbose, --help/-h,
+  // --force, and the value after --interval). deploy.js doesn't
+  // know about those. --force is consumed by the wrapper's
+  // mid-game guard above; passing it through would have deploy.js
+  // print a "WARNING --force with manager.js running" line that
+  // doesn't apply (the wrapper already handled the override
+  // decision). We ADD --quiet by default so the 30s loop doesn't
+  // flood the terminal — --verbose opts out, --once always wants
+  // full output.
   const deployArgs = args.filter((a, i) => {
-    if (a === "--once" || a === "--verbose" || a === "-h" || a === "--help") return false;
+    if (a === "--once" || a === "--verbose" || a === "-h" || a === "--help" || a === "--force") return false;
     if (a === "--interval") return false;
     if (i > 0 && args[i - 1] === "--interval") return false;  // the value after --interval
     return true;

@@ -9,9 +9,23 @@
 // Default worker is hack-loop.js. Override with the first positional
 // arg if you ever need a different worker.
 //
+// Mid-game refusal: if manager.js is currently running on home, the
+// centralized HWGW orchestrator already owns the rooted target set.
+// Per-server hack-loop.js fan-out at this point is HARMFUL — it
+// drains moneyAvailable on a continuous loop, so manager.js's
+// pserv-launched ns.hack() returns $0.000 on otherwise-sane targets
+// (Pitfall 8 in bitburner-dev: per-server and centralized HWGW
+// systems can't coexist). We refuse to deploy by default and require
+// --force for the early-game case where manager.js isn't running yet
+// or for explicit testing. monitor-deploy.js applies the same guard.
+//
 // Usage:
 //   run deploy.js                            # default: hack-loop.js
 //   run deploy.js worker.js                  # custom worker name
+//   run deploy.js --force                    # override mid-game guard
+//   run deploy.js --quiet                    # suppress per-host DEPLOY/SKIP lines (used by monitor-deploy.js)
+//   run deploy.js --quiet worker.js          # custom worker + quiet
+//   run deploy.js --force --quiet            # override + quiet
 //
 // Worker contract: the worker takes a target hostname as its first arg
 // and runs the H/G/W loop against that target. hack-loop.js does this.
@@ -27,8 +41,10 @@
 const USAGE = `Usage:
  run deploy.js                       # default: hack-loop.js as worker
  run deploy.js worker.js             # custom worker name
+ run deploy.js --force               # override mid-game guard (manager.js running)
  run deploy.js --quiet               # suppress per-host DEPLOY/SKIP lines (used by monitor-deploy.js)
  run deploy.js --quiet worker.js     # custom worker + quiet
+ run deploy.js --force --quiet       # override + quiet
 `;
 
 export async function main(ns) {
@@ -42,9 +58,45 @@ export async function main(ns) {
   // NOTE: --quiet must be parsed BEFORE ns.args[0] is read as the
   // worker name, otherwise deploy.js will treat it as a worker.
   const quiet = ns.args.includes("--quiet");
-  // Filter --quiet out before treating ns.args[0] as the worker name.
-  const filteredArgs = ns.args.filter((a) => a !== "--quiet");
+  const force = ns.args.includes("--force");
+  // Filter --quiet and --force out before treating ns.args[0] as the
+  // worker name. The order matters: --quiet is a deploy.js flag
+  // (relay from monitor-deploy.js), --force is a deploy.js flag
+  // (override mid-game guard). Both are stripped here so a stray
+  // --force in argv[0] doesn't get treated as a worker filename.
+  const filteredArgs = ns.args.filter((a) => a !== "--quiet" && a !== "--force");
   const worker = filteredArgs[0]?.toString() ?? "hack-loop.js";
+
+  // Mid-game guard: if manager.js is running on home, refuse by
+  // default. The centralized orchestrator already owns the rooted
+  // target set; per-server fan-out at this point drains
+  // moneyAvailable on a continuous loop and breaks manager.js's
+  // pserv-launched ns.hack() (returns $0.000 on otherwise-sane
+  // targets). --force opts in for the early-game case or for
+  // explicit testing. The check is cheap (one ns.ps() call) and
+  // turns a silent destructive side-effect ("hack-loop.js quietly
+  // appeared on every rooted target") into a clear, actionable
+  // refusal. See Pitfall 8 in bitburner-dev and the long comment
+  // at the top of master.js.
+  const managerRunning = ns.ps("home").some((p) => p.filename === "manager.js");
+  if (managerRunning && !force) {
+    ns.tprint(
+      "deploy: refused — manager.js is running on home. " +
+      "The centralized HWGW orchestrator already owns the rooted target set; " +
+      "per-server hack-loop.js fan-out drains moneyAvailable and breaks " +
+      "manager.js's $X.XXX hacks (Pitfall 8 in bitburner-dev). " +
+      "Pass --force to override, or run manager.js for the centralized system."
+    );
+    return;
+  }
+  if (managerRunning && force) {
+    ns.tprint(
+      "deploy: WARNING --force with manager.js running — " +
+      "hack-loop.js on targets will drain moneyAvailable and break " +
+      "manager.js's pserv-launched hacks. Remove the hack-loop.js " +
+      "processes (kill hack-loop.js) when you're done testing."
+    );
+  }
   const SOURCE = "home";
 
   const me = ns.getPlayer();

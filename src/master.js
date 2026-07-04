@@ -68,10 +68,18 @@
 // means a stale `deploy.js` process is still running from an
 // earlier session — kill it with `kill <pid>` (find via `ps`).
 //
+// Belt-and-suspenders: even if a stale deploy.js / monitor-deploy.js
+// process is somehow launched (manual `run`, leftover from a pre-
+// master.js boot, etc.), the script itself refuses to deploy
+// workers when manager.js is running on home, with a clear message
+// pointing at --force to override. See src/deploy.js and
+// src/monitor-deploy.js for the guard.
+//
 // To re-enable deploy.js for small-server-only fan-out (e.g. for
 // the xp farm or non-batch targets), run it manually with a
-// --target filter. For now, manager.js owns the whole rooted
-// target set and no other script should be deploying workers.
+// --target filter (and --force if manager.js is up). For now,
+// manager.js owns the whole rooted target set and no other script
+// should be deploying workers.
 const USAGE = `Usage:
 run master.js                  # start every long-lived monitor
 run master.js --once            # print current monitor status, don't (re)start
