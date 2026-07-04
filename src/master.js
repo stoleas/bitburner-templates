@@ -45,9 +45,23 @@
 //   monitor-hacknet.js    (60s, no args)
 //   monitor-buy.js        (30s, no args)
 //   monitor-sync.js       (30s, no args)  — re-runs sync-all.js so filesync edits reach the fleet
-//   monitor-deploy.js     (30s, no args)  — runs AFTER monitor-sync so the just-synced files are picked up
 //   monitor-servers.js    (60s, no args)  — fills the pserv fleet in lockstep with wallet
 //   manager.js            (60s, no args)  — HWGW orchestrator that USES the fleet
+//
+// NOTE: monitor-deploy.js is intentionally NOT in this list at
+// mid-game scale. The per-server hack-loop.js fan-out that
+// monitor-deploy.js drives was the right shape for early game
+// (hack level <100, home RAM <256 GB) but is now actively HARMFUL
+// at mid-game: hack-loop.js runs ON the target server and drains
+// it on a continuous loop, so when manager.js fires a hw.js/weaken.js
+// from a pserv the target's moneyAvailable is 0 (just drained) and
+// the worker returns instantly with nothing to do. You see workers
+// appear on pservs and disappear in 1-2 seconds — that's the symptom.
+//
+// To re-enable monitor-deploy.js for small-server-only fan-out
+// (e.g. for the xp farm or non-batch targets), pass --target
+// filter via deploy.js itself. For now, manager.js owns the
+// whole rooted target set.
 const USAGE = `Usage:
 run master.js                          # start every long-lived monitor
 run master.js --deploy-interval 60000  # override monitor-deploy poll cadence (ms)
@@ -66,7 +80,6 @@ const MONITORS = [
   ["monitor-hacknet.js",  60_000, []],
   ["monitor-buy.js",      30_000, []],
   ["monitor-sync.js",     30_000, []],
-  ["monitor-deploy.js",   30_000, ["--interval", "30000"]],
   ["monitor-servers.js",  60_000, []],
   ["manager.js",          60_000, []],
 ];
