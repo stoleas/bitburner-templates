@@ -105,7 +105,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-nuke: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, nuke-args=[${nukeArgs.join(" ") || "(none)"}]`);
+  if (verbose) ns.tprint(`monitor-nuke: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, nuke-args=[${nukeArgs.join(" ") || "(none)"}]`);
   while (true) {
     await runNukeOnce();
     await ns.sleep(intervalMs);

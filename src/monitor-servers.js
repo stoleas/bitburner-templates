@@ -332,7 +332,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-servers: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, cap=${newServerCap}, rule=${(ruleFraction * 100).toFixed(0)}%`);
+  if (verbose) ns.tprint(`monitor-servers: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, cap=${newServerCap}, rule=${(ruleFraction * 100).toFixed(0)}%`);
   while (true) {
     pass();
     await ns.sleep(intervalMs);

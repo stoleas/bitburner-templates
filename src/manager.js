@@ -104,7 +104,15 @@ function pickTargets(ns) {
 
 export async function main(ns) {
   ns.disableLog("sleep");
-  ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms`);
+  // Manager is auto-quiet by default — it runs every 60s and the
+  // per-tick summary only goes to the terminal when something
+  // interesting happened (a batch launched, or the target list
+  // became empty). For first-time setup or debugging, run with
+  // --verbose to see every tick.
+  const verbose = ns.args.includes("--verbose");
+  if (verbose) {
+    ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms, output=verbose`);
+  }
 
   while (true) {
     const tickStart = Date.now();
@@ -159,7 +167,19 @@ export async function main(ns) {
       .map(([k, v]) => `${k}=${v}`)
       .join(" ");
     const elapsed = Date.now() - tickStart;
+    // Surface interesting state to the terminal. A tick with no
+    // launches is informational, not a positive change, so we
+    // only print it once per minute. The per-tick log line goes
+    // to ns.print (so the in-game log has it for /verbose users)
+    // and the terminal gets a one-line summary on ticks where
+    // something HAPPENED.
     ns.print(`manager: tick ${(elapsed / 1000).toFixed(1)}s targets=[${targets.join(",")}] ${summary || "(no changes)"}`);
+    if (counters.launched > 0 || counters.planned === 0) {
+      // Positive event (a batch launched) or zero-target (something
+      // changed in the network: every server became unreachable,
+      // or all targets are now out-of-level). Either way, surface it.
+      ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no changes)"}`);
+    }
 
     // Wait until the next tick boundary. We've already burned some
     // time on per-job sleeps, so the residual is small.

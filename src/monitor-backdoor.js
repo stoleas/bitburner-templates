@@ -60,21 +60,28 @@ export async function main(ns) {
     return;
   }
   ns.disableLog("sleep");
+  ns.disableLog("getServerMoneyAvailable");
   ns.disableLog("scan");
-  ns.disableLog("getServer");
-
+  // Output mode: default QUIET — only the very first table is
+  // shown (so you can see the script started and what its initial
+  // state is), then we suppress all subsequent tables UNLESS a new
+  // READY server appeared (the actionable event) or --verbose is
+  // passed. monitor-backdoor's quiet mode is what the rest of the
+  // monitor family now follows.
+  //
+  // --once disables quiet and prints the full table on the first
+  // pass and exits (diagnostic).
   const args = (ns.args || []).map(String);
   const once = args.includes("--once");
   const includeBackdoored = args.includes("--include-backdoored");
-  // Default ON: show the full copy-paste chain in the READY line.
-  // Pass --no-path to print just the server name (useful when
-  // running on a long-lived monitor where the topology is already
-  // known). This is the inverse of the old --show-path flag.
   const showPath = !args.includes("--no-path");
-  // Default quiet: change prints only fire when a new READY server
-  // appeared. --verbose opts back into all state-change prints. --once
-  // always prints full (it's a diagnostic run).
   const verbose = args.includes("--verbose");
+  // Print the "started" banner only in verbose mode. Quiet mode
+  // assumes the user knows monitor-backdoor.js is running (it's in
+  // master.js) and doesn't need the per-tick confirmation.
+  if (verbose) {
+    ns.tprint(`monitor-backdoor: started, interval=${POLL_MS}ms, output=verbose`);
+  }
 
   // BFS the reachable network. We also build a `parent` map so we
   // can reconstruct the path from home to any host — useful for
@@ -260,10 +267,16 @@ export async function main(ns) {
     return { status: m, parent, readyCount };
   }
 
-  // Initial table.
+  // Initial table. In quiet mode (the default) we DON'T print
+  // the startup table either — the user explicitly asked for
+  // "only see these messages when something positively changed",
+  // so the initial empty table ("no READY servers") would
+  // contradict that. Print the initial table only in --once or
+  // --verbose.
   let last = fullSnapshot();
-  printTable("startup", last.parent);
-
+  if (once || verbose) {
+    printTable("startup", last.parent);
+  }
   if (once) return;
 
   while (true) {

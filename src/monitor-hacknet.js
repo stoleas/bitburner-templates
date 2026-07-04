@@ -321,7 +321,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-hacknet: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, cap=${newNodeCap}, rule=${(ruleFraction * 100).toFixed(0)}%`);
+  if (verbose) ns.tprint(`monitor-hacknet: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, cap=${newNodeCap}, rule=${(ruleFraction * 100).toFixed(0)}%`);
   while (true) {
     pass();
     await ns.sleep(intervalMs);

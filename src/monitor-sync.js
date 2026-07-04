@@ -127,7 +127,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-sync: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, sync-args=[${syncArgs.join(" ") || "(none)"}]`);
+  if (verbose) ns.tprint(`monitor-sync: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, sync-args=[${syncArgs.join(" ") || "(none)"}]`);
   while (true) {
     await runSyncOnce();
     await ns.sleep(intervalMs);

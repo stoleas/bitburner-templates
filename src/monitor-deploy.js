@@ -125,7 +125,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-deploy: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, deploy-args=[${deployArgs.join(" ") || "(none)"}]`);
+  if (verbose) ns.tprint(`monitor-deploy: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, deploy-args=[${deployArgs.join(" ") || "(none)"}]`);
   while (true) {
     await runDeployOnce();
     await ns.sleep(intervalMs);
