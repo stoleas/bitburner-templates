@@ -60,10 +60,11 @@ export function planBatch(ns, target, opts) {
   const weakenThreads = Math.max(weakenForHack, weakenForGrow);
 
   // Arrive at T = weakenTime - LANE_BUFFER_MS. Each job's delay is set
-  // so its own runtime carries it to T. Math.max(0, ...) guards against
-  // a hypothetical future target whose runtime is below the buffer.
+  // so its own runtime carries it to T. Bitburner's ns.exec accepts
+  // negative delay (interpreted as "fire immediately"), so the weaken
+  // job's natural delay of -LANE_BUFFER_MS works as intended.
   const arrivalT = a.weakenTime - LANE_BUFFER_MS;
-  const delay = (scriptTime) => Math.max(0, arrivalT - scriptTime);
+  const delay = (scriptTime) => arrivalT - scriptTime;
 
   const jobs = [
     { script: "hack.js",   threads: hackThreads,   delayMs: delay(a.hackTime)   },
