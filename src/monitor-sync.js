@@ -33,23 +33,28 @@
 //
 // Output: sync-all.js does its own printing; we just relay and wait.
 // Pass --keep-stale to sync-all.js if you don't want it to remove
-// files that exist on remote but not on home. --once runs a single
-// sync-all.js pass with full output (the diagnostic use case).
+// files that exist on remote but not on home. Pass --quiet to
+// sync-all.js if you don't want the per-host SKIP/SYNCED lines
+// (recommended for the 30s loop — the cluster is huge and the
+// per-host status is noise). --once runs a single sync-all.js pass
+// with full output (the diagnostic use case).
 //
 // Usage:
-//   run monitor-sync.js                  # loop, every 30s
+//   run monitor-sync.js                  # loop, every 30s, QUIET (default)
 //   run monitor-sync.js --once           # one sync-all.js pass, full output, then exit
 //   run monitor-sync.js --interval 15000 # loop, every 15s
 //   run monitor-sync.js --keep-stale     # forward to sync-all.js: don't remove stale files
+//   run monitor-sync.js --verbose        # loop, full per-host output (no --quiet)
 //
 // Requires sync-all.js to be present on home (it normally is, via
 // the standard build pipeline).
 //
 const USAGE = `Usage:
-run monitor-sync.js                  # loop, every 30s
+run monitor-sync.js                  # loop, every 30s, QUIET (default)
 run monitor-sync.js --once           # one sync-all.js pass, full output, then exit
 run monitor-sync.js --interval 15000 # loop, every 15s
 run monitor-sync.js --keep-stale     # forward to sync-all.js: don't remove stale files
+run monitor-sync.js --verbose        # loop, full per-host output
 `;
 
 const SYNC = "sync-all.js";
@@ -75,11 +80,9 @@ export async function main(ns) {
   // sync-all.js verbatim. The `--` separator is conventional for
   // "everything after this is for the child" but we don't strictly
   // require it — any arg that isn't one of ours is passed through.
-  // This way `run monitor-sync.js --keep-stale` and `run
-  // monitor-sync.js --keep-stale --verbose` (if we ever add a
-  // --verbose) both work.
   const args = ns.args.slice();
   const once = args.includes("--once");
+  const verbose = args.includes("--verbose");
   const intervalIdx = args.indexOf("--interval");
   const intervalMs = intervalIdx >= 0
     ? Number(args[intervalIdx + 1])
@@ -90,14 +93,20 @@ export async function main(ns) {
   }
 
   // Build the sync-all.js arg list: pass through everything except
-  // our own flags (--once, --interval, --help/-h, and the value
-  // after --interval). sync-all.js doesn't know about those.
+  // our own flags (--once, --interval, --verbose, --help/-h, and
+  // the value after --interval). sync-all.js doesn't know about
+  // those. We ADD --quiet by default so the 30s loop doesn't flood
+  // the terminal with per-host SKIP/SYNCED lines — --verbose opts
+  // out, --once always wants full output.
   const syncArgs = args.filter((a, i) => {
-    if (a === "--once" || a === "-h" || a === "--help") return false;
+    if (a === "--once" || a === "--verbose" || a === "-h" || a === "--help") return false;
     if (a === "--interval") return false;
     if (i > 0 && args[i - 1] === "--interval") return false;  // the value after --interval
     return true;
   });
+  if (!verbose && !once && !syncArgs.includes("--quiet")) {
+    syncArgs.push("--quiet");
+  }
 
   // One sync-all.js invocation. We wait for it to finish so we know
   // when to fire the next tick — running two sync-all.js passes in
@@ -118,7 +127,7 @@ export async function main(ns) {
     return;
   }
 
-  ns.tprint(`monitor-sync: started, interval=${intervalMs}ms, sync-args=[${syncArgs.join(" ") || "(none)"}]`);
+  ns.tprint(`monitor-sync: started, interval=${intervalMs}ms, output=${verbose ? "verbose" : "quiet"}, sync-args=[${syncArgs.join(" ") || "(none)"}]`);
   while (true) {
     await runSyncOnce();
     await ns.sleep(intervalMs);

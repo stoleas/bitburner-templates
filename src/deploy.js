@@ -16,9 +16,19 @@
 // Worker contract: the worker takes a target hostname as its first arg
 // and runs the H/G/W loop against that target. hack-loop.js does this.
 //
+// This is the ONE-SHOT version: it does a single pass over the network
+// and exits. For the always-on "re-fan-out when a new server gets
+// rooted" use case, see monitor-deploy.js — it loops on a 30s
+// cadence. (Older versions of this file had a 5-minute auto-restart
+// baked in; that was the right idea at the wrong cadence and made the
+// file awkward to use as a one-shot. Splitting the two concerns into
+// deploy.js + monitor-deploy.js is cleaner.)
+//
 const USAGE = `Usage:
-  run deploy.js                       # default: hack-loop.js as worker
-  run deploy.js worker.js             # custom worker name
+ run deploy.js                       # default: hack-loop.js as worker
+ run deploy.js worker.js             # custom worker name
+ run deploy.js --quiet               # suppress per-host DEPLOY/SKIP lines (used by monitor-deploy.js)
+ run deploy.js --quiet worker.js     # custom worker + quiet
 `;
 
 export async function main(ns) {
@@ -26,7 +36,15 @@ export async function main(ns) {
     ns.tprint(USAGE);
     return;
   }
-  const worker = ns.args[0]?.toString() ?? "hack-loop.js";
+  // --quiet suppresses the per-host DEPLOY/SKIP/FAIL lines but keeps
+  // the summary. monitor-deploy.js passes this by default on its 30s
+  // loop so the terminal doesn't get flooded with per-host status.
+  // NOTE: --quiet must be parsed BEFORE ns.args[0] is read as the
+  // worker name, otherwise deploy.js will treat it as a worker.
+  const quiet = ns.args.includes("--quiet");
+  // Filter --quiet out before treating ns.args[0] as the worker name.
+  const filteredArgs = ns.args.filter((a) => a !== "--quiet");
+  const worker = filteredArgs[0]?.toString() ?? "hack-loop.js";
   const SOURCE = "home";
 
   const me = ns.getPlayer();
@@ -48,6 +66,11 @@ export async function main(ns) {
     return;
   }
 
+  // Convenience: per-host printers that respect --quiet. Status-block
+  // events (DEPLOYED, SKIP-*, FAIL-*) are still aggregated into
+  // counters and printed in the summary.
+  const print = (line) => { if (!quiet) ns.tprint(line); };
+
   let deployed = 0;
   const counters = {
     "DEPLOYED": 0,
@@ -68,7 +91,7 @@ export async function main(ns) {
 
   for (const host of hosts) {
     if (host === SOURCE) {
-      ns.tprint(`SKIP-self  ${host}`);
+      print(`SKIP-self  ${host}`);
       counters["SKIP-self"]++;
       continue;
     }
@@ -78,7 +101,7 @@ export async function main(ns) {
     // Skip purchased servers — they have no money to hack. Run
     // deploy-share.js to put share.js on them instead.
     if (s.purchasedByPlayer) {
-      ns.tprint(`SKIP-purchased  ${host}  (run deploy-share.js to put share.js here)`);
+      print(`SKIP-purchased  ${host}  (run deploy-share.js to put share.js here)`);
       counters["SKIP-purchased"]++;
       continue;
     }
@@ -89,19 +112,19 @@ export async function main(ns) {
     if (!s.hasAdminRights) {
       const req = ns.getServerNumPortsRequired(host);
       const reqHack = ns.getServerRequiredHackingLevel(host);
-      ns.tprint(`SKIP-rooted     ${host}  (need ${req} port-opener, hack ${reqHack}/${myHack})`);
+      print(`SKIP-rooted     ${host}  (need ${req} port-opener, hack ${reqHack}/${myHack})`);
       counters["SKIP-rooted"]++;
       continue;
     }
 
     if (!s.moneyMax || s.moneyMax <= 0) {
-      ns.tprint(`SKIP-nomoney    ${host}  (moneyMax=0 — faction/backdoor server, no cash to steal)`);
+      print(`SKIP-nomoney    ${host}  (moneyMax=0 — faction/backdoor server, no cash to steal)`);
       counters["SKIP-nomoney"]++;
       continue;
     }
 
     if ((s.requiredHackingSkill ?? 0) > myHack) {
-      ns.tprint(`SKIP-hack       ${host}  (need hack ${s.requiredHackingSkill}, have ${myHack})`);
+      print(`SKIP-hack       ${host}  (need hack ${s.requiredHackingSkill}, have ${myHack})`);
       counters["SKIP-hack"]++;
       continue;
     }
@@ -109,14 +132,14 @@ export async function main(ns) {
     // If a copy of the worker is already running on the host, leave it
     // alone. This makes deploy.js safe to re-run.
     if (ns.ps(host).some((p) => p.filename === worker)) {
-      ns.tprint(`SKIP-running    ${host}  (${worker} already running)`);
+      print(`SKIP-running    ${host}  (${worker} already running)`);
       counters["SKIP-running"]++;
       continue;
     }
 
     // Copy the worker script to the target.
     if (!ns.scp(worker, host, SOURCE)) {
-      ns.tprint(`FAIL-scp        ${host}`);
+      print(`FAIL-scp        ${host}`);
       counters["FAIL-scp"]++;
       continue;
     }
@@ -127,7 +150,7 @@ export async function main(ns) {
     const threads = Math.max(1, Math.floor(free / ramPerThread));
 
     if (threads < 1 || ramPerThread <= 0) {
-      ns.tprint(`SKIP-ram        ${host}  (no free RAM: ${free.toFixed(2)} GB, ${worker} needs ${ramPerThread.toFixed(2)} GB)`);
+      print(`SKIP-ram        ${host}  (no free RAM: ${free.toFixed(2)} GB, ${worker} needs ${ramPerThread.toFixed(2)} GB)`);
       counters["SKIP-ram"]++;
       continue;
     }
@@ -138,12 +161,12 @@ export async function main(ns) {
     // single hardcoded target if you want a "swarm" all hitting one.
     const pid = ns.exec(worker, host, threads, host);
     if (pid === 0) {
-      ns.tprint(`FAIL-exec       ${host}  (exec returned 0 — RAM contention or other script running)`);
+      print(`FAIL-exec       ${host}  (exec returned 0 — RAM contention or other script running)`);
       counters["FAIL-exec"]++;
       continue;
     }
 
-    ns.tprint(`DEPLOYED        ${host}  ${worker} x${threads} (pid ${pid})`);
+    print(`DEPLOYED        ${host}  ${worker} x${threads} (pid ${pid})`);
     counters["DEPLOYED"]++;
   }
 
@@ -153,8 +176,4 @@ export async function main(ns) {
     .map(([k, v]) => `${k}=${v}`)
     .join(" ");
   ns.tprint(`done: ${summary} (scanned ${hosts.length} hosts)`);
-  // Auto-restart every 5 minutes so newly-nuked servers get workers too.
-  // ns.exec(...) on a server that already has the worker running is
-  // skipped by the check above, so this is safe.
-  await ns.sleep(5 * 60 * 1000);
 }

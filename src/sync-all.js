@@ -1,6 +1,6 @@
 /** @param {NS} ns */
 //
-// Sync every .js file from home to every reachable server in the
+// sync-all.js — Sync every .js file from home to every reachable server in the
 // network. Use this after editing scripts in src/ to push updates
 // out to the fleet without restarting the workers (already-running
 // processes keep their old in-memory copy; only on next launch do
@@ -25,10 +25,12 @@
 // Usage:
 //   run sync-all.js              # push new + remove deleted (default)
 //   run sync-all.js --keep-stale # push new, but DON'T remove anything
+//   run sync-all.js --quiet      # suppress per-host lines (used by monitor-sync.js)
 //
 const USAGE = `Usage:
   run sync-all.js              # push new + remove deleted (default)
   run sync-all.js --keep-stale # push new, but DON'T remove anything
+  run sync-all.js --quiet      # suppress per-host SKIP/SYNCED lines
 `;
 
 export async function main(ns) {
@@ -37,6 +39,12 @@ export async function main(ns) {
     return;
   }
   const keepStale = ns.args.includes("--keep-stale");
+  // --quiet suppresses per-host SKIP/SYNCED/REMOVED lines but keeps
+  // the summary. monitor-sync.js passes this by default on its 30s
+  // loop so the terminal doesn't get flooded. Errors (FAIL-scp,
+  // FAIL-rm) and the start/end banners still print — the user
+  // always wants to see when something went wrong.
+  const quiet = ns.args.includes("--quiet");
 
   const SOURCE = "home";
   const homeFiles = new Set(ns.ls(SOURCE, ".js").filter((f) => !f.endsWith(".d.ts")));
@@ -76,6 +84,10 @@ export async function main(ns) {
     return new Set(ns.ps(host).map((p) => p.filename));
   }
 
+  // Convenience: per-host printers that respect --quiet. Start/end
+  // banners and the summary still print via ns.tprint directly.
+  const print = (line) => { if (!quiet) ns.tprint(line); };
+
   for (const host of hosts) {
     if (host === SOURCE) {
       counters["SKIP-self"]++;
@@ -85,7 +97,7 @@ export async function main(ns) {
     // Skip unrooted hosts — scp/rm will fail anyway, but we report
     // the reason distinctly so you can see what's blocked.
     if (!ns.hasRootAccess(host)) {
-      ns.tprint(`SKIP-no-root    ${host}`);
+      print(`SKIP-no-root    ${host}`);
       counters["SKIP-no-root"]++;
       continue;
     }
@@ -93,7 +105,7 @@ export async function main(ns) {
     // Push every home file to the host.
     const pushOk = ns.scp([...homeFiles], host, SOURCE);
     if (!pushOk) {
-      ns.tprint(`FAIL-scp        ${host}  (scp returned false)`);
+      print(`FAIL-scp        ${host}  (scp returned false)`);
       counters["FAIL-scp"]++;
       // Don't try to remove on a host we couldn't write to — skip
       // the whole host. Symmetric: if the scp fails, treat the
@@ -110,22 +122,22 @@ export async function main(ns) {
       const running = runningFilenamesOn(host);
       for (const f of stale) {
         if (running.has(f)) {
-          ns.tprint(`SKIP-running    ${host}/${f}  (worker is using it; kill the process and re-run)`);
+          print(`SKIP-running    ${host}/${f}  (worker is using it; kill the process and re-run)`);
           counters["SKIP-running"]++;
           continue;
         }
         if (ns.rm(f, host)) {
-          ns.tprint(`REMOVED         ${host}/${f}  (no longer on home)`);
+          print(`REMOVED         ${host}/${f}  (no longer on home)`);
           counters["REMOVED"]++;
           removed++;
         } else {
-          ns.tprint(`FAIL-rm         ${host}/${f}`);
+          print(`FAIL-rm         ${host}/${f}`);
           counters["FAIL-rm"]++;
         }
       }
     }
 
-    ns.tprint(`SYNCED          ${host}  (${homeFiles.size} pushed${removed > 0 ? `, ${removed} removed` : ""})`);
+    print(`SYNCED          ${host}  (${homeFiles.size} pushed${removed > 0 ? `, ${removed} removed` : ""})`);
     counters["SYNCED"]++;
   }
 
