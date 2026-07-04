@@ -44,7 +44,8 @@
 //   monitor-nuke.js       (60s, no args)
 //   monitor-hacknet.js    (60s, no args)
 //   monitor-buy.js        (30s, no args)
-//   monitor-deploy.js     (30s, no args)
+//   monitor-sync.js       (30s, no args)  — re-runs sync-all.js so filesync edits reach the fleet
+//   monitor-deploy.js     (30s, no args)  — runs AFTER monitor-sync so the just-synced files are picked up
 //   monitor-servers.js    (60s, no args)  — fills the pserv fleet in lockstep with wallet
 //   manager.js            (60s, no args)  — HWGW orchestrator that USES the fleet
 const USAGE = `Usage:
@@ -64,6 +65,7 @@ const MONITORS = [
   ["monitor-nuke.js",     60_000, []],
   ["monitor-hacknet.js",  60_000, []],
   ["monitor-buy.js",      30_000, []],
+  ["monitor-sync.js",     30_000, []],
   ["monitor-deploy.js",   30_000, ["--interval", "30000"]],
   ["monitor-servers.js",  60_000, []],
   ["manager.js",          60_000, []],
