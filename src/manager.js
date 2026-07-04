@@ -143,8 +143,36 @@ export async function main(ns) {
         // can see WHY batches aren't launching. Without this,
         // the per-tick summary prints "(no changes)" and the
         // error is buried in the in-game log.
+        //
+        // Bitburner 3.x sometimes throws non-Error values where
+        // .message is undefined. We coerce safely:
+        //   - Error instance:  use e.message
+        //   - string/number:   use String(e)
+        //   - null/undefined:  use "threw: <value>"
+        //   - object:          JSON.stringify the value (truncated)
+        let what;
+        if (e == null) {
+          what = `threw: ${e}`;  // literally "threw: null" or "threw: undefined"
+        } else if (typeof e === "object" && e.message) {
+          what = e.message;
+        } else if (typeof e === "object") {
+          try { what = `threw object: ${JSON.stringify(e).slice(0, 200)}`; }
+          catch { what = `threw object: <not serializable>`; }
+        } else {
+          what = String(e);
+        }
+        // If we have server state, surface it inline so the user
+        // doesn't have to grep through logs to understand the
+        // context. This is the most useful piece of info.
+        let ctx = "";
+        try {
+          const ss = ns.getServer(target);
+          ctx = ` [moneyMax=${ss.moneyMax} moneyAvailable=${ss.moneyAvailable} ` +
+                `minSec=${ss.minDifficulty} curSec=${ss.hackDifficulty} ` +
+                `reqHack=${ss.requiredHackingSkill} hasRoot=${ss.hasAdminRights}]`;
+        } catch { /* ignore */ }
         counters["FAIL-plan"] = (counters["FAIL-plan"] || 0) + 1;
-        ns.tprint(`manager: planBatch(${target}) failed: ${e.message}`);
+        ns.tprint(`manager: planBatch(${target}) failed: ${what}${ctx}`);
         continue;
       }
       counters.planned++;
