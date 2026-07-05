@@ -387,34 +387,49 @@ export async function main(ns) {
         if (verbose) {
           ns.print(`manager: SKIP-unhealthy target=${target} curMoney=$${ns.getServerMoneyAvailable(target).toLocaleString()} maxMoney=$${ns.getServerMaxMoney(target).toLocaleString()} curSec=${ns.getServerSecurityLevel(target).toFixed(2)} minSec=${ns.getServerMinSecurityLevel(target).toFixed(2)}`);
         }
-        // Fall back to drain (single-host weaken) to start
-        // recovering the target. This is a fire-and-forget op
-        // that doesn't gate on cooldown or fleet spread — we
-        // just want to drop security below minSec + 5 ASAP.
-        // skeesler's pattern calls this `drain()`; we inline a
-        // minimal version because the manager's main loop is
-        // already running and we don't want to wait for the
-        // worker to land before moving to the next target.
+        // Two cases when isHealthy returns false:
+        //
+        //  (A) curSec > minSec + 5  (security drifted) — fire a
+        //      drain to bring sec back down. This is the original
+        //      skeesler pattern.
+        //
+        //  (B) money < 50% × (1 - hackFrac) × maxMoney (drained
+        //      money, sec already at min) — the target is waiting
+        //      for the natural regrow timer. The drain is a NO-OP
+        //      because secToDrop = 0, and firing a 1-thread weaken
+        //      every tick is just wasting RAM (the previous version
+        //      of this code generated 1408+ weaken.js processes
+        //      across the pservs in ~2 minutes, see commit
+        //      1f2f38c).
+        //
+        // For (B) we just `continue` — wait for the regrow timer
+        // to refill the target, then the next tick's isHealthy
+        // check will return true and the normal HWGW path fires.
+        // This is the correct behavior: don't try to "drain" money
+        // out of a drained target, the regrow is automatic.
+        const curSec = ns.getServerSecurityLevel(target);
+        const minSec = ns.getServerMinSecurityLevel(target);
+        const secToDrop = Math.max(0, curSec - minSec - HEALTH_SEC_TOLERANCE);
+        if (secToDrop <= 0) {
+          // Case (B): drained money, sec is fine. Skip — let
+          // the natural regrow finish. Don't fire a no-op weaken.
+          continue;
+        }
+        // Case (A): security drifted. Fire a single drain on the
+        // biggest free worker. threads = ceil(secToDrop / 0.05)
+        // because each weaken thread drops 0.05 security.
         const weakenRam = ns.getScriptRam("weaken.js", "home");
         const workers = listWorkers(ns);
-        const targetFree = ns.getServerMaxRam(target) - ns.getServerUsedRam(target);
         const biggestWorker = workers.reduce((best, w) => {
           const free = ns.getServerMaxRam(w) - ns.getServerUsedRam(w);
           return free > best.free ? { h: w, free } : best;
         }, { h: null, free: 0 });
         if (biggestWorker.h && biggestWorker.free >= weakenRam) {
-          const drainThreads = Math.floor(biggestWorker.free * 0.95 / weakenRam);
-          // Cap to "enough to bring curSec to minSec + 5" — the
-          // isHealthy threshold. We don't need to fully prep the
-          // target here; we just need to make the next isHealthy
-          // check pass.
-          const secToDrop = Math.max(0, ns.getServerSecurityLevel(target) - ns.getServerMinSecurityLevel(target) - HEALTH_SEC_TOLERANCE);
-          const minThreads = Math.ceil(secToDrop / 0.05);
-          const threads = Math.min(drainThreads, Math.max(minThreads, 1));
+          const threads = Math.ceil(secToDrop / 0.05);
           if (ns.exec("weaken.js", biggestWorker.h, threads, target) > 0) {
             counters["draining"] = (counters["draining"] || 0) + 1;
             if (verbose) {
-              ns.print(`manager: DRAIN ${biggestWorker.h} ${threads} weaken threads target=${target} (curSec=${ns.getServerSecurityLevel(target).toFixed(2)}, minSec=${ns.getServerMinSecurityLevel(target).toFixed(2)})`);
+              ns.print(`manager: DRAIN ${biggestWorker.h} ${threads} weaken threads target=${target} (curSec=${curSec.toFixed(2)}, minSec=${minSec.toFixed(2)}, secToDrop=${secToDrop.toFixed(2)})`);
             }
           }
         }
