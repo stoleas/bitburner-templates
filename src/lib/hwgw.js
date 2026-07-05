@@ -460,6 +460,46 @@ export function fleetFree(ns, fleet) {
 }
 
 /**
+ * Stage the worker scripts (hack.js, weaken.js, grow.js) to every
+ * host in the fleet. Idempotent — if the scripts are already on
+ * the host, ns.scp is a no-op. Used by the manager to stage once
+ * per tick instead of once per allocateBatch call.
+ *
+ * Cost: O(fleet.size × 3) ns.scp calls. With a 39-host fleet,
+ * that's 117 calls per tick. ns.scp returns immediately if the
+ * file is already on the host, so subsequent ticks are cheap.
+ */
+export function stageWorkers(ns, fleet, scripts = ["hack.js", "weaken.js", "grow.js"]) {
+  for (const { h } of fleet) {
+    for (const script of scripts) {
+      if (!ns.fileExists(script, h)) {
+        ns.scp(script, h, "home");
+      }
+    }
+  }
+}
+
+/**
+ * Refresh the per-host free-RAM field of a cached fleet without
+ * re-running listReachableServers' BFS. Returns a NEW fleet object
+ * with updated `r` (the headroom) reflecting the latest free RAM
+ * per host.
+ *
+ * The fleet's host list is stable for the whole tick; only the
+ * per-host free RAM changes as workers are placed. Re-running
+ * buildFleet() per job was doing ~70 ns.scan calls per call,
+ * which hung the browser at 45 calls per tick.
+ */
+export function recheckFleetRam(ns, fleet, homeHeadroomRam = HOME_HEADROOM_GB) {
+  return fleet.map(({ h }) => {
+    const max = ns.getServerMaxRam(h);
+    const used = ns.getServerUsedRam(h);
+    const headroom = h === "home" ? homeHeadroomRam : 0;
+    return { h, r: Math.max(0, max - used - headroom) };
+  });
+}
+
+/**
  * Bin-pack `threads` of `script` across the fleet's free RAM, all
  * threads fired with the same `target`, `delay`, and `id` so the
  * effects sum on the target (a single op may span several hosts).
@@ -542,12 +582,11 @@ export function shareRamCap(ns, fleet) {
  * doesn't fire on the first batch.
  */
 export function allocateBatch(ns, fleet, plan, target, targetOffset, id, verbose) {
-  // stage workers to every fleet host (idempotent; cheap on small fleets).
-  for (const { h } of fleet) {
-    for (const script of ["hack.js", "weaken.js", "grow.js"]) {
-      if (!ns.fileExists(script, h)) ns.scp(script, h, "home");
-    }
-  }
+  // Workers are staged once per tick by the manager's
+  // stageWorkers() call at the top of the outer loop. The
+  // previous per-call scp was 117 calls × 36 calls per tick =
+  // 4212 ns.scp round-trips per tick, which was hanging the
+  // browser. Idempotent no-op if already staged.
   let minPlaced = Infinity;
   const placement = [];  // for --verbose: which host got how many threads of which job
   for (const job of plan.jobs) {

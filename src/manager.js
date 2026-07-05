@@ -155,6 +155,8 @@ import {
   // lib/hwgw.js for any one-shot tool that still needs single-host
   // dispatch.)
   buildFleet,
+  recheckFleetRam,
+  stageWorkers,
   allocateBatch,
   fleetFree,
   shareRamCap,
@@ -292,13 +294,25 @@ export async function main(ns) {
     // worker pool for normal-mode batches. It's rebuilt per-job
     // inside the per-target loop (Pitfall 6: stale worker lists
     // produce FAIL-exec after sleeps), but the initial build here
-    // gives us the per-tick "fleetFree()" number for the 5%
-    // headroom gate.
-    //
-    // The fleet is sized off the CURRENT RAM state. As workers
-    // are placed, the fleet's free RAM shrinks. The per-job
-    // buildFleet() inside the loop reads the latest values.
+    // Build the fleet ONCE per tick. The BFS scan in
+    // listReachableServers is ~70 ns.scan calls; calling it 45
+    // times per tick (9 targets × 5 in the per-target +
+    // per-job loops) is what was hanging the browser. The
+    // fleet's MEMBERSHIP (which servers are workers) is stable
+    // for the whole tick; only the per-host free RAM changes as
+    // we place workers. The per-job `recheckFleetRam()` call
+    // re-reads max/used for the cached host list without
+    // re-running the BFS.
     const fleet = buildFleet(ns);
+    if (verbose) {
+      ns.print(`manager: fleet built: ${fleet.length} hosts, free=${fleetFree(ns, fleet).toFixed(1)}GB`);
+    }
+    // Stage worker scripts to the whole fleet ONCE per tick.
+    // allocateBatch used to do this per call, which meant 36
+    // scp passes per tick × 39 hosts × 3 scripts = 4212 scp
+    // calls per tick. ns.scp is idempotent but each call is a
+    // WebSocket round-trip; staging once cuts that to 117.
+    stageWorkers(ns, fleet);
 
     for (let ti = 0; ti < targets.length; ti++) {
       const target = targets[ti];
@@ -594,12 +608,14 @@ export async function main(ns) {
           if (jobDelay > 0) {
             await ns.sleep(jobDelay);
           }
-          // Recheck fleet right before exec (Pitfall 6: stale
-          // worker list → stale "yes this has room" answers).
-          // We rebuild the fleet rather than relying on the
-          // cached one from the top of the tick — another
-          // monitor may have claimed RAM during our sleeps.
-          const freshFleet = buildFleet(ns);
+          // Recheck fleet free RAM right before exec (Pitfall 6:
+          // stale worker list → stale "yes this has room" answers).
+          // The fleet's host list is stable for the whole tick; only
+          // per-host free RAM changes as we place workers. We refresh
+          // RAM with recheckFleetRam() instead of rebuild the fleet
+          // (avoids ~70 ns.scan calls × 36 calls per tick = 2520
+          // scans/sec, which was hanging the browser).
+          const freshFleet = recheckFleetRam(ns, fleet);
           const placed = allocateBatch(
             ns, freshFleet,
             // Wrap the single job in a 1-element plan so we can
