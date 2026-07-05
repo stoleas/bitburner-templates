@@ -416,25 +416,6 @@ export async function main(ns) {
           ns.print(`manager: RECOVERY ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
         }
       } else {
-        // Normal mode: 5% headroom gate. The fleet-batcher
-        // *will* partially place a batch that's too big, leaving
-        // a partial hack without a matching grow — the target
-        // would drain to $0 and never refill. The gate rejects
-        // any batch whose total RAM doesn't fit in the fleet's
-        // 95% free window, so partial placements never happen
-        // in practice. (Sourced from skeesler/bitburner-commander.)
-        const batchRam = totalBatchRam(ns, plan);
-        const free = fleetFree(ns, fleet);
-        if (batchRam > free * FLEET_DEFAULTS.FLEET_HEADROOM_FRACTION) {
-          // The batch would partial-place. SKIP-ram and let the
-          // next tick try again (the fleet may have more free
-          // RAM after the previous tick's workers returned).
-          counters["SKIP-ram"]++;
-          if (verbose) {
-            ns.print(`manager: SKIP-fleet-fit target=${target} batch=${batchRam.toFixed(0)}GB fleetFree=${free.toFixed(0)}GB`);
-          }
-          continue;
-        }
         // Per-target share cap (MAX_FLEET_SHARE = 1/3): no single
         // target can claim more than 1/3 of the fleet's total
         // capacity for one batch. Without this gate, the top-
@@ -444,11 +425,35 @@ export async function main(ns) {
         // not per-job — a single big weaken is fine as long as
         // the total batch stays under the share. Sourced from
         // skeesler/bitburner-commander.
+        //
+        // Check FIRST (more restrictive than 5% headroom, which
+        // only reserves 5% of free RAM as a safety buffer).
+        // Sharing is the higher-order concern: even if the fleet
+        // has 95% free, no single target should claim > 1/3.
+        const batchRam = totalBatchRam(ns, plan);
         const shareCap = shareRamCap(ns, fleet);
         if (batchRam > shareCap) {
           counters["SKIP-share"] = (counters["SKIP-share"] || 0) + 1;
           if (verbose) {
             ns.print(`manager: SKIP-share target=${target} batch=${batchRam.toFixed(0)}GB cap=${shareCap.toFixed(0)}GB (MAX_FLEET_SHARE=${FLEET_DEFAULTS.MAX_FLEET_SHARE})`);
+          }
+          continue;
+        }
+        // 5% headroom gate: the fleet-batcher *will* partially
+        // place a batch that's too big, leaving a partial hack
+        // without a matching grow — the target would drain to $0
+        // and never refill. The gate rejects any batch whose
+        // total RAM doesn't fit in the fleet's 95% free window,
+        // so partial placements never happen in practice.
+        // (Sourced from skeesler/bitburner-commander.)
+        const free = fleetFree(ns, fleet);
+        if (batchRam > free * FLEET_DEFAULTS.FLEET_HEADROOM_FRACTION) {
+          // The batch would partial-place. SKIP-ram and let the
+          // next tick try again (the fleet may have more free
+          // RAM after the previous tick's workers returned).
+          counters["SKIP-ram"]++;
+          if (verbose) {
+            ns.print(`manager: SKIP-fleet-fit target=${target} batch=${batchRam.toFixed(0)}GB fleetFree=${free.toFixed(0)}GB`);
           }
           continue;
         }

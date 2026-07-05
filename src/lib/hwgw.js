@@ -218,8 +218,9 @@ export function planBatch(ns, target, opts) {
 
   // The full batch's bottleneck is the LARGEST single job (usually
   // one of the two weakens). If the fleet (per-target share) can
-  // carry it, we run a normal HWGW. Otherwise, we drop to recovery
-  // mode (weaken-only, sized to the largest single worker).
+  // carry the WHOLE batch (4 jobs summed), we run a normal HWGW.
+  // Otherwise, we drop to recovery mode (weaken-only, sized to
+  // the largest single worker).
   const biggestJobRam = Math.max(
     hackThreads * ramByScript["hack.js"],
     weakenThreads * ramByScript["weaken.js"],
@@ -227,13 +228,27 @@ export function planBatch(ns, target, opts) {
   );
 
   // Fleet-aware check: can the fleet (per-target share) carry the
-  // biggest job? If yes, normal HWGW.
-  // Fallback check: if the fleet is too small (e.g. < 2x the biggest
-  // job), use the single-host check as a sanity gate. The 2x
-  // multiplier is conservative: if the fleet can't carry 2 batches
-  // of the biggest job, it's a single-host operation regardless.
-  const fleetCanCarry = biggestJobRam <= perTargetFleetCap
-    && totalFleetFree >= 2 * biggestJobRam;
+  // WHOLE batch? We use `totalRam` (the 4-job sum) because that's
+  // what the manager will actually place — `biggestJobRam` only
+  // tells us the single largest op, but the fleet has to carry
+  // all 4 jobs in sequence. The 5% headroom is applied upstream
+  // in manager.js; planBatch's check is a coarser "can the
+  // fleet, period, fit this batch?" gate.
+  //
+  // The previous version of this check (`biggestJobRam <=
+  // perTargetFleetCap && totalFleetFree >= 2 * biggestJobRam`)
+  // was too strict: the 2× safety meant a fleet where pservs are
+  // busy with prior-tick workers would never see normal HWGW,
+  // even when the biggest job (which is what the new fleet
+  // pattern actually needs to fit) comfortably fits in the
+  // total free RAM. That false-positive recovery mode fired on
+  // every tick in the user's game state, leaving the targets
+  // permanently in recovery even when their drift was 0.
+  //
+  // Correct check: `totalRam <= totalFleetFree` — the whole
+  // batch fits in the fleet's free RAM. Per-target share is
+  // enforced upstream in manager.js via shareRamCap.
+  const fleetCanCarry = totalRam <= totalFleetFree;
 
   if (!fleetCanCarry) {
     // Recovery mode: weaken-only, sized to the largest free worker.
