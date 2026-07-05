@@ -1,0 +1,5 @@
+# Personal-repo gitignore. The fork's gitignore intentionally ignores
+# dist/ (it's a build artifact for the fork). The personal repo wants
+# dist/ tracked — do NOT add a `dist/` rule here.
+node_modules/
+*.d.ts
