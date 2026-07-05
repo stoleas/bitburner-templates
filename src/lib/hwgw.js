@@ -10,6 +10,30 @@ import { NS } from "@ns";
 // below so a future fast target can't produce negative delayMs.
 const LANE_BUFFER_MS = 50;
 
+// GB of home RAM kept free for system scripts (monitor-nuke.js's
+// nuke.js invocations, monitor-buy.js's purchase programs, etc.).
+// Without this, the fleet-batcher happily consumes all of home's
+// free RAM and the next nuke.js / buy.exe launch fails with
+// "not enough RAM" — the Pitfall 25 / "home headroom for system
+// scripts" issue. 32 GB covers a single nuke.js (~10 GB) plus
+// a bit of buffer. Bump up if you add larger system scripts.
+const HOME_HEADROOM_GB = 32;
+
+// Fraction of fleetFree reserved as a "fragmentation buffer" for
+// the fleet-batcher. Sourced from skeesler/bitburner-commander:
+// the 5% headroom absorbs per-host fragmentation (free RAM
+// scattered in sub-thread slivers across pservs) so allocate()
+// can always place every op fully. Without it, a partial placement
+// produces a partial batch (hack without enough grow) which
+// drains the target without refilling it. See the
+// fleet-batcher-pattern ref in bitburner-dev skill.
+const FLEET_HEADROOM_FRACTION = 0.95;
+
+// Cap on a single target's fleet share. Without this, the top-
+// ranked target takes the whole cluster and other targets starve.
+// Sourced from skeesler/bitburner-commander (MAX_FLEET_SHARE = 1/3).
+const MAX_FLEET_SHARE = 1 / 3;
+
 /**
  * Pull the per-target timing + state we need to plan a batch.
  * Throws if the target isn't rooted.
@@ -317,3 +341,205 @@ export function findLargestWorkerWithRam(ns, workers, needRam, homeHeadroomRam =
   }
   return bestName;
 }
+
+// ============================================================================
+// Fleet-batcher helpers — distribute one batch's threads across the whole
+// cluster (home + pservs + rooted world servers), not just one host.
+// Sourced from skeesler/bitburner-commander/fleet-batcher.js (MIT-style,
+// public domain). The single biggest BN1 mid-game win: turns 15 TB of
+// fleet capacity into a usable target for batches that would otherwise
+// need 100+ TB on a single host.
+// ============================================================================
+
+/**
+ * BFS the network from home. Returns the sorted list of every
+ * reachable hostname EXCEPT home. Used by buildFleet() to find
+ * rooted world servers that can host workers.
+ */
+export function listReachableServers(ns) {
+  const SOURCE = "home";
+  const seen = new Set([SOURCE]);
+  const queue = [SOURCE];
+  while (queue.length > 0) {
+    const h = queue.shift();
+    for (const n of ns.scan(h)) {
+      if (!seen.has(n)) { seen.add(n); queue.push(n); }
+    }
+  }
+  return [...seen].filter((h) => h !== SOURCE).sort();
+}
+
+/**
+ * Build the fleet pool: home + every purchased server + every rooted
+ * world server with usable RAM.
+ *
+ * A world server can be a worker host for one fleet and a hack target
+ * of another at the same time — the two roles don't interfere. This
+ * is the key insight that makes the fleet-batcher work: 50 GB of CSEC
+ * + 32 GB of foodnstuff + 16 GB of joesguns + 11 pservs × 1 TB +
+ * home 1 TB = 12+ TB of usable fleet where before there was just
+ * home + 11 pservs.
+ *
+ * Each entry is `{h, r}` where h is the hostname and r is the GB to
+ * keep free on that host (headroom for system scripts; only home
+ * gets a real value).
+ */
+export function buildFleet(ns, homeHeadroomRam = HOME_HEADROOM_GB) {
+  const pservs = ns.cloud.getServerNames();
+  const pservSet = new Set(pservs);
+  // Rooted world servers (CSEC, foodnstuff, joesguns, etc.) — every
+  // server with admin rights and a non-zero max RAM. Excluded from
+  // the hack-target list by pickTargets(); they can be workers
+  // for OTHER targets freely. A pserv-0 with 1 TB and a CSEC with
+  // 50 GB both contribute to the same fleet.
+  const worldHosts = listReachableServers(ns).filter(
+    (h) => !pservSet.has(h) && ns.hasRootAccess(h) && ns.getServerMaxRam(h) > 0
+  );
+  return [
+    { h: "home", r: homeHeadroomRam },
+    ...pservs.map((h) => ({ h, r: 0 })),
+    ...worldHosts.map((h) => ({ h, r: 0 })),
+  ];
+}
+
+/**
+ * Total free RAM across the fleet, in GB. Sums `max - used - reserve`
+ * for every fleet member. Used by the 5% headroom rule to gate batch
+ * launches.
+ */
+export function fleetFree(ns, fleet) {
+  let free = 0;
+  for (const { h, r } of fleet) {
+    free += Math.max(0, ns.getServerMaxRam(h) - ns.getServerUsedRam(h) - r);
+  }
+  return free;
+}
+
+/**
+ * Bin-pack `threads` of `script` across the fleet's free RAM, all
+ * threads fired with the same `target`, `delay`, and `id` so the
+ * effects sum on the target (a single op may span several hosts).
+ *
+ * Returns the number of threads actually placed (threads - remaining).
+ * A return value < threads is a PARTIAL placement — the manager
+ * treats this as a batch failure (Pitfall 22-style: don't stamp
+ * lastFireMs, let the next tick re-attempt the full batch).
+ *
+ * The 5% headroom rule in the manager (`if (totalBatchRam(b) <=
+ * fleetFree * FLEET_HEADROOM_FRACTION)`) is what prevents partial
+ * placements from happening in practice. The function itself will
+ * happily place partial batches; the gate is upstream.
+ *
+ * Cost: O(fleet.size) per call. fleet is typically ~15-50 members
+ * (1 home + 25 pservs max + ~20 rooted world servers), so a few
+ * hundred simple arithmetic ops per job × 4 jobs per batch =
+ * ~2000 ops per batch dispatch. Negligible.
+ */
+export function allocate(ns, fleet, script, threads, target, delay, id) {
+  const ram = ns.getScriptRam(script);
+  let remaining = threads;
+  for (const { h, r } of fleet) {
+    if (remaining <= 0) break;
+    const free = Math.max(0, ns.getServerMaxRam(h) - ns.getServerUsedRam(h) - r);
+    const canFit = Math.floor(free / ram);
+    if (canFit <= 0) continue;
+    const put = Math.min(canFit, remaining);
+    if (ns.exec(script, h, put, target, Math.round(delay), id)) remaining -= put;
+  }
+  return threads - remaining;
+}
+
+/**
+ * Distribute all 4 jobs of a plan across the fleet, returning the
+ * minimum threads-placed across the 4 jobs (0 if any job partial).
+ * The caller treats min===0 as "batch failed, don't stamp cooldown"
+ * and treats min===4 as "batch fully placed, stamp cooldown."
+ *
+ * Workers are pushed to the fleet hosts via ns.scp first so the
+ * `Script <name> does not exist on host` failure mode (Pitfall 22)
+ * doesn't fire on the first batch.
+ */
+export function allocateBatch(ns, fleet, plan, target, targetOffset, id, verbose) {
+  // stage workers to every fleet host (idempotent; cheap on small fleets).
+  for (const { h } of fleet) {
+    for (const script of ["hack.js", "weaken.js", "grow.js"]) {
+      if (!ns.fileExists(script, h)) ns.scp(script, h, "home");
+    }
+  }
+  let minPlaced = Infinity;
+  const placement = [];  // for --verbose: which host got how many threads of which job
+  for (const job of plan.jobs) {
+    const jobDelay = job.delayMs + targetOffset;
+    const placed = allocate(ns, fleet, job.script, job.threads, target, jobDelay, id);
+    if (placed < job.threads && minPlaced === Infinity) minPlaced = 0;  // early-out
+    if (placed < minPlaced) minPlaced = placed;
+    if (verbose) placement.push({ script: job.script, threads: placed, of: job.threads, delay: jobDelay });
+  }
+  return { minPlaced, placement };
+}
+
+/**
+ * Strict prep check: target is at min security AND max money. Used
+ * at the boundary between prep() and the main loop to know when
+ * prep is finished. NOT a per-tick gate — a running batcher's
+ * money dips and recovers by design, so a per-tick isPrepped()
+ * check would say "NOT PREPPED" every mid-cycle tick and trigger
+ * wasteful re-prep work.
+ */
+export function isPrepped(ns, target) {
+  return ns.getServerSecurityLevel(target) <= ns.getServerMinSecurityLevel(target) + 0.01 &&
+         ns.getServerMoneyAvailable(target) >= ns.getServerMaxMoney(target) * 0.999;
+}
+
+/**
+ * Tolerant health check: target is roughly prepped. True throughout
+ * normal batch oscillation, false only on real desync (money crashed
+ * or security spiked far above min). Use this in the main loop as
+ * the recovery-mode trigger; the cure is a few prep weakens, not
+ * waiting for isPrepped's strict boundary.
+ *
+ * hackFraction is the per-batch steal fraction (matches manager's
+ * MONEY_FRACTION). A running batcher should oscillate between
+ * (1 - hackFraction) and 1.0 of moneyMax; if it's below 50% of
+ * (1 - hackFraction), the grow isn't keeping up and the target
+ * is desynced.
+ */
+export function isHealthy(ns, target, hackFraction) {
+  const maxMoney = ns.getServerMaxMoney(target);
+  const minSec = ns.getServerMinSecurityLevel(target);
+  const money = ns.getServerMoneyAvailable(target);
+  const sec = ns.getServerSecurityLevel(target);
+  return money >= maxMoney * (1 - hackFraction) * 0.5 && sec <= minSec + 5;
+}
+
+/**
+ * Total RAM a plan will use across the fleet. Used by the 5% headroom
+ * rule to gate launches: only fire if `totalBatchRam(plan) <=
+ * fleetFree(fleet) * FLEET_HEADROOM_FRACTION`.
+ *
+ * The cap on per-thread RAM is `ns.getScriptRam(script, "home")` —
+ * scripts have a constant RAM cost regardless of where they run, so
+ * the script's home is a valid reference. Worker scripts are
+ * deployed to every fleet host via allocateBatch's scp loop, so the
+ * "RAM cost on the host" question is settled before the call.
+ */
+export function totalBatchRam(ns, plan) {
+  const hackRam = ns.getScriptRam("hack.js", "home");
+  const weakenRam = ns.getScriptRam("weaken.js", "home");
+  const growRam = ns.getScriptRam("grow.js", "home");
+  return plan.jobs.reduce(
+    (sum, j) =>
+      sum + j.threads * (j.script === "hack.js" ? hackRam : j.script === "weaken.js" ? weakenRam : growRam),
+    0
+  );
+}
+
+// Re-export the constants for callers that want to read the same
+// numbers (e.g. manager.js's per-target fleet share cap, dryrun's
+// "would this batch fit?" check). Defaults: 32 GB home headroom,
+// 95% fleet headroom, 1/3 per-target share cap.
+export const FLEET_DEFAULTS = {
+  HOME_HEADROOM_GB,
+  FLEET_HEADROOM_FRACTION,
+  MAX_FLEET_SHARE,
+};

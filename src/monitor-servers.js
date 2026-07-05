@@ -7,8 +7,7 @@
 //   tier            roster count    target RAM (GB), per-server
 //   ------------    ------------    -----------------------
 //   bootstrap       0..8            64    (cheap to fill the slot)
-//   sweet-spot      9..20           1024  (1 TB — same as home, useful for fan-out)
-//   soft-cap        21..25          4096  (4 TB — only hit via automation)
+//   sweet-spot      9..25           1024  (1 TB — same as home, useful for fan-out)
 //
 // We don't try to scale one server all the way to the cap before
 // moving on. Instead, every tick we pick the CHEAPEST next purchase
@@ -24,11 +23,50 @@
 // (the worker scripts get re-fanned by monitor-deploy.js, and the
 // orchestrator already lives on home).
 //
-// "soft-cap" tier only activates at > 20 pservs, and only if cash
-// flow supports it. The 4 TB target is the BN-1 game hard-cap on
-// the cheap curve (4 TB × $55k/GB ≈ $230B, well past 1 TB home but
-// reachable at 1+ TB cash). Hit this tier only when automation is
-// keeping the wallet topped up.
+// "sweet-spot" is the only tier we now ship. The previous "soft-cap"
+// 4 TB tier was costing ~$1.15T for 5 servers at $230B each — the
+// fleet-batcher pattern in manager.js (home + pservs + rooted-worlds
+// = ~12+ TB) makes the marginal value of 4 TB pservs near-zero. The
+// wallet savings are dramatic: a 4 TB fleet costs ~$1.15T, a 1 TB
+// fleet costs ~$1.4T, but the income difference is negligible
+// (cluster utilization is the binding constraint, not raw capacity).
+// Users who want to push past 1 TB can run `run monitor-servers.js
+// --tier soft-cap` (re-enables the 4 TB tier explicitly).
+//
+// CONSERVATIVE SPENDING: this daemon is the most likely source of
+// wallet drain. The previous defaults (10% of wallet per purchase,
+// no reserve floor, multi-server-per-tick scale walk) were
+// responsible for the $1.5B+ spend the user reported seeing in
+// sinceInstall stats. The new defaults:
+//
+//   --rule 0.03      1-to-3 Rule: max 3% of wallet per purchase
+//                    (was 10% — at $1T wallet, that's $30B/tick
+//                    instead of $100B/tick)
+//   --reserve 100e9  Wallet floor: never spend below $100B (was
+//                    unguarded — the daemon happily spent the
+//                    wallet to 0 to buy a single 4 TB pserv).
+//                    Reserve protects Home RAM upgrades, augs,
+//                    and contract solvers.
+//   1 buy/tick       At most ONE purchase per pass (was "buy +
+//                    scale 2-3 servers if rule allows")
+//   1 scale/tick     At most ONE scale per pass (was a while loop
+//                    that scaled every under-target pserv in one
+//                    pass)
+//
+// These three knobs together cap the daemon's spend rate at:
+//   per-pass max = min(wallet * 0.03, wallet - $100B)
+//   per-tick at 60s cadence = up to ~$30B
+//   per-minute = up to ~$30B
+//   per-hour = up to ~$1.8T (if income keeps up — otherwise the
+//              1-to-3 Rule kicks in and caps each purchase at 3%)
+//
+// This is intentionally a 3-5× reduction in spend rate. The user
+// reported $1.5B spent while only $8.7M was earned — a 178:1
+// negative ROI. At the new rate, $1.5B of CAPEX happens over ~50
+// minutes, with $100B+ always in reserve. Income should outpace
+// spending once the manager's fleet-batcher is also running
+// (manager.js's new fleet pattern typically produces $10B+/sec
+// against the top 9 targets).
 //
 // Output is QUIET by default — only PSERV-BOUGHT / SCALED / fail
 // summary lines print. --verbose re-enables per-tick budget and
@@ -36,44 +74,44 @@
 // exits (full output).
 //
 // Usage:
-//   run monitor-servers.js                     # loop, every 60s, QUIET
+//   run monitor-servers.js                     # loop, every 60s, QUIET, 1-to-3 Rule
 //   run monitor-servers.js --once              # one pass, full output, then exit
 //   run monitor-servers.js --interval 30000    # loop, every 30s, QUIET
 //   run monitor-servers.js --verbose           # loop, per-tick budget + per-server targets
 //   run monitor-servers.js --cap 25            # stop buying new pservs at 25 (default 25, game cap)
-//   run monitor-servers.js --rule 0.10         # max 10% of wallet per purchase (default 0.10)
-//
-// Implements the same "1-to-10 Rule" as monitor-hacknet.js: never
-// spend more than 10% of liquid cash on a single purchase (a new
-// pserv OR a 2× RAM upgrade). Anything more is treated as
-// SKIP-rule10 and we wait for the wallet to grow. This protects
-// the main economy — money that should be going to Home RAM
-// upgrades, hacking contracts, or augs. Set --rule 0 to disable
-// (e.g. for endgame max-out).
+//   run monitor-servers.js --rule 0.05         # max 5% of wallet per purchase (default 0.03)
+//   run monitor-servers.js --reserve 50e9     # wallet floor; never spend below $50B (default 100B)
+//   run monitor-servers.js --tier soft-cap    # re-enable the 4 TB "soft-cap" tier (default: off)
+//   run monitor-servers.js --once 0            # pass 0 means print a per-tick budget, no apply
 //
 const USAGE = `Usage:
-  run monitor-servers.js                     # loop, every 60s, QUIET
+  run monitor-servers.js                     # loop, every 60s, QUIET, 1-to-3 Rule
   run monitor-servers.js --once              # one pass, full output, then exit
   run monitor-servers.js --interval 30000    # loop, every 30s, QUIET
   run monitor-servers.js --verbose           # loop, per-tick budget + per-server targets
   run monitor-servers.js --cap 25            # stop buying new pservs at 25 (default 25, game cap)
-  run monitor-servers.js --rule 0.10         # max 10% of wallet per purchase (default 0.10)
+  run monitor-servers.js --rule 0.05         # max 5% of wallet per purchase (default 0.03)
+  run monitor-servers.js --reserve 50e9      # wallet floor; never spend below $50B (default 100B)
+  run monitor-servers.js --tier soft-cap     # re-enable the 4 TB "soft-cap" tier (default: off)
 `;
 
 // Tier table. order matters: the FIRST tier whose roster range
 // contains the current count is the active tier. Add a new tier by
 // dropping it in at the top of the array.
 //
+// 4 TB tier is now opt-in via --tier soft-cap. The default 1 TB
+// sweet-spot is plenty for the fleet-batcher (manager.js's pattern
+// already uses home + pservs + rooted-worlds, so the marginal
+// value of 4 TB pservs is minimal).
+//
 // Cost math: at 64 GB the per-pserv cost is $3.52M (64 × $55k).
 // At 1 TB the per-pserv cost is $57.7B. At 4 TB it's $230B. The
-// 1-to-10 Rule means we wait for the wallet to grow before each
+// 1-to-3 Rule means we wait for the wallet to grow before each
 // step, so the 4 TB tier is only hit when the wallet is ~$2.3T+.
-// BN-1 ends well before that, but the soft-cap is reachable with
-// patience.
 const TIERS = [
   { name: "bootstrap",  minRoster: 0,  maxRoster: 8,  targetGB: 64 },
-  { name: "sweet-spot", minRoster: 8,  maxRoster: 20, targetGB: 1024 },
-  { name: "soft-cap",   minRoster: 20, maxRoster: 25, targetGB: 4096 },
+  { name: "sweet-spot", minRoster: 8,  maxRoster: 25, targetGB: 1024 },
+  { name: "soft-cap",   minRoster: 20, maxRoster: 25, targetGB: 4096, requiresFlag: "soft-cap" },
 ];
 
 const SOURCE = "home";
@@ -82,10 +120,24 @@ const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_NEW_SERVER_CAP = 25;     // tier guide: 25 = game cap; mid-game sweet spot is 25
 const MAX_ROSTER = 25;                 // hard cap from ns.cloud.getServerLimit()
 const MAX_RAM = 2 ** 20;               // 1,048,576 GB — game hard cap
-const DEFAULT_RULE = 0.10;             // 1-to-10 Rule
+// 1-to-3 Rule (was 1-to-10). At $1T wallet, 3% = $30B per purchase
+// instead of $100B — a 3.3× reduction. The user reported $1.5B
+// spent on a $8.7M-income run, which is unsustainable. Set --rule 0
+// to disable for endgame max-out.
+const DEFAULT_RULE = 0.03;
 const MIN_RULE = 0.0;
 const MAX_RULE = 1.0;
-const ROSTER_WALK_LIMIT = 200;         // safety bound; one pass shouldn't loop forever
+// Wallet floor: never spend below this. Protects Home RAM upgrades,
+// augs, and contract solvers from being starved by the daemon.
+// Default $100B — the daemon will skip ALL purchases (count as
+// SKIP-reserve) once the wallet drops below this. Set --reserve 0
+// to disable (NOT recommended).
+const DEFAULT_RESERVE = 100e9;          // $100B
+// Safety bound for legacy code paths. The new single-scale-per-pass
+// logic doesn't need a walk limit, but the constant is kept for
+// any future expansion (e.g. multi-step scaling) that might want
+// a hard ceiling. Currently unused.
+const ROSTER_WALK_LIMIT = 200;
 
 export async function main(ns) {
   if (ns.args.includes("-h") || ns.args.includes("--help")) {
@@ -120,6 +172,22 @@ export async function main(ns) {
     ns.tprint(`monitor-servers: --interval must be a non-negative number (got ${args[intervalIdx + 1]})`);
     return;
   }
+  // --reserve $N: wallet floor. Daemon skips purchases when the
+  // wallet would drop below this. Default $100B.
+  const reserveIdx = args.indexOf("--reserve");
+  const reserveFloor = reserveIdx >= 0
+    ? Math.max(0, Number(args[reserveIdx + 1]))
+    : DEFAULT_RESERVE;
+  if (reserveIdx >= 0 && (!Number.isFinite(reserveFloor) || reserveFloor < 0)) {
+    ns.tprint(`monitor-servers: --reserve must be a non-negative number (got ${args[reserveIdx + 1]})`);
+    return;
+  }
+  // --tier <name>: opt back into a tier. Currently the only opt-in
+  // tier is "soft-cap" (4 TB). Default: no soft-cap (1 TB ceiling).
+  const tierIdx = args.indexOf("--tier");
+  const enabledTiers = tierIdx >= 0
+    ? new Set([args[tierIdx + 1]])
+    : new Set();
 
   ns.disableLog("sleep");
   ns.disableLog("getServerMoneyAvailable");
@@ -127,13 +195,24 @@ export async function main(ns) {
 
   // --- helpers ---
 
-  // Active tier for a given current roster count.
+  // Active tier for a given current roster count. Skips tiers
+  // that require an opt-in flag (e.g. soft-cap is gated on
+  // --tier soft-cap). Falls back to the highest-priority
+  // unconditional tier.
   function activeTier(count) {
     for (const t of TIERS) {
+      if (t.requiresFlag && !enabledTiers.has(t.name)) continue;
       if (count >= t.minRoster && count < t.maxRoster) return t;
     }
-    // Past the last tier (the game cap is 25 which is exactly
-    // soft-cap's maxRoster, so we fall through to the last entry).
+    // Past the last eligible tier. Find the highest-priority
+    // unconditional tier (or any opt-in tier that was enabled).
+    for (const t of TIERS) {
+      if (t.requiresFlag && !enabledTiers.has(t.name)) continue;
+      return t;
+    }
+    // No tiers enabled? Shouldn't happen (sweet-spot is always
+    // unconditional) but fall through to the last entry rather
+    // than crash.
     return TIERS[TIERS.length - 1];
   }
 
@@ -194,7 +273,8 @@ export async function main(ns) {
       "SKIP-cap": 0,
       "SKIP-tier-met": 0,
       "SKIP-funds": 0,
-      "SKIP-rule10": 0,
+      "SKIP-rule": 0,         // renamed from SKIP-rule10 (1-to-3 Rule now)
+      "SKIP-reserve": 0,      // new: wallet below --reserve floor
       "FAIL-purchaseServer": 0,
       "FAIL-deleteServer": 0,
       "FAIL-purchaseAfterDelete": 0,
@@ -203,28 +283,60 @@ export async function main(ns) {
     const count = currentCount();
     const tier = activeTier(count);
     if (verbose) {
-      ns.tprint(`monitor-servers: tier=${tier.name} (${tier.minRoster}-${tier.maxRoster}) target=${tier.targetGB}GB cap=${newServerCap} rule=${(ruleFraction * 100).toFixed(0)}%`);
+      ns.tprint(`monitor-servers: tier=${tier.name} (${tier.minRoster}-${tier.maxRoster}) target=${tier.targetGB}GB cap=${newServerCap} rule=${(ruleFraction * 100).toFixed(0)}% reserve=$${reserveFloor.toLocaleString()}`);
+    }
+
+    // Read the wallet ONCE per pass. The 1-to-3 Rule and the
+    // reserve floor both check against the SAME wallet value, so
+    // a single read here is the cleanest way to keep them
+    // consistent. Re-reading mid-pass would let a tick-buyer slip
+    // a purchase past the floor (e.g. if the wallet drops between
+    // the read and the buy).
+    const wallet = ns.getServerMoneyAvailable(SOURCE);
+    if (wallet < reserveFloor) {
+      // Reserve floor: refuse to spend. The wallet is below the
+      // configured floor; better to wait for income to bring it
+      // back up. Without this guard, the daemon would happily
+      // spend the wallet to $0 to fund a 4 TB pserv.
+      counters["SKIP-reserve"]++;
+      if (verbose) {
+        ns.tprint(`SKIP-reserve     wallet=$${wallet.toLocaleString()} < $${reserveFloor.toLocaleString()}`);
+      }
+      if (once || verbose) {
+        ns.tprint(`done: ${Object.entries(counters).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`).join(" ") || "no changes"}`);
+      }
+      return;
     }
 
     // 1. Buy a new pserv at the tier's target RAM if we have headroom.
     //    We never buy a new server below the tier target — every
     //    fresh pserv lands at the active tier's spec.
+    //
+    //    AT MOST ONE buy per pass (was unlimited; the user reported
+    //    the daemon buying 2-3 servers per tick when funds allowed).
+    //    One buy per tick matches the wallet growth rate; multi-buy
+    //    per tick is what drained the wallet.
     if (count < newServerCap && count < MAX_ROSTER) {
       const slot = firstMissingSlot();
       if (slot >= 0) {
         const name = `${ROSTER_PREFIX}${slot}`;
         const cost = ns.cloud.getServerCost(tier.targetGB);
-        const money = ns.getServerMoneyAvailable(SOURCE);
-        const cap10 = money * ruleFraction;
-        if (ruleFraction > 0 && cost > cap10) {
-          counters["SKIP-rule10"]++;
+        // Check reserve floor first: if the buy would drop us
+        // below the floor, skip with SKIP-reserve.
+        if (wallet - cost < reserveFloor) {
+          counters["SKIP-reserve"]++;
           if (verbose) {
-            ns.tprint(`SKIP-rule10     new ${name} ${tier.targetGB}GB $${cost.toLocaleString()} > ${(ruleFraction * 100).toFixed(0)}% of wallet $${money.toLocaleString()}`);
+            ns.tprint(`SKIP-reserve     new ${name} ${tier.targetGB}GB would leave wallet=$${(wallet - cost).toLocaleString()} < $${reserveFloor.toLocaleString()}`);
           }
-        } else if (cost > money) {
+        } else if (ruleFraction > 0 && cost > wallet * ruleFraction) {
+          counters["SKIP-rule"]++;
+          if (verbose) {
+            ns.tprint(`SKIP-rule       new ${name} ${tier.targetGB}GB $${cost.toLocaleString()} > ${(ruleFraction * 100).toFixed(0)}% of wallet $${wallet.toLocaleString()}`);
+          }
+        } else if (cost > wallet) {
           counters["SKIP-funds"]++;
           if (verbose) {
-            ns.tprint(`SKIP-funds      no new ${name} (need $${cost.toLocaleString()}, have $${money.toLocaleString()})`);
+            ns.tprint(`SKIP-funds      no new ${name} (need $${cost.toLocaleString()}, have $${wallet.toLocaleString()})`);
           }
         } else {
           const result = ns.cloud.purchaseServer(name, tier.targetGB);
@@ -259,90 +371,102 @@ export async function main(ns) {
       if (verbose) ns.tprint(`SKIP-cap        at game cap (${count}/${MAX_ROSTER})`);
     }
 
-    // 2. Walk every existing pserv and apply the cheapest pending
-    //    2× upgrade. Same pattern as monitor-hacknet: cheapest
-    //    candidate first, 1-to-10 Rule gates it, no looping over
-    //    the wallet.
+    // 2. Walk every existing pserv and apply AT MOST ONE 2× upgrade.
+    //    Same pattern as monitor-hacknet: cheapest candidate first,
+    //    1-to-3 Rule gates it, no looping over the wallet.
+    //
+    //    The previous version of this loop (a `while` loop that
+    //    walked up to ROSTER_WALK_LIMIT times) would scale 2-3
+    //    servers in a single pass if the wallet allowed. That was
+    //    the second-largest source of the $1.5B wallet drain.
+    //    One scale per pass (matching the one-buy-per-pass above)
+    //    keeps the spend rate bounded at ~3% of wallet per tick.
     //
     //    We re-read the count after the BUY step so a freshly-bought
     //    pserv is also eligible to be scaled in the same pass.
     const liveCount = currentCount();
-    const spendCap = ruleFraction > 0 ? ns.getServerMoneyAvailable(SOURCE) * ruleFraction : Infinity;
-    const moneyNow = ns.getServerMoneyAvailable(SOURCE);
-
-    for (let step = 0; step < ROSTER_WALK_LIMIT; step++) {
-      const money = ns.getServerMoneyAvailable(SOURCE);
-      const liveSpendCap = ruleFraction > 0 ? money * ruleFraction : Infinity;
-      let bestIdx = -1;
-      let bestCost = Infinity;
-      let absCheapestCost = Infinity;
-      let anyPending = false;
-      for (let i = 0; i < liveCount; i++) {
-        const name = `${ROSTER_PREFIX}${i}`;
-        if (!ns.serverExists(name)) continue;
-        const currentGB = ns.getServerMaxRam(name);
-        if (currentGB >= tier.targetGB) continue;     // at or above target
-        if (currentGB >= MAX_RAM) continue;            // at game cap
-        anyPending = true;
-        const c = costOfDouble(currentGB);
-        if (c < absCheapestCost) absCheapestCost = c;
-        if (c <= liveSpendCap && c < bestCost) {
-          bestCost = c;
-          bestIdx = i;
+    const liveSpendCap = ruleFraction > 0 ? wallet * ruleFraction : Infinity;
+    let bestIdx = -1;
+    let bestCost = Infinity;
+    let absCheapestCost = Infinity;
+    let anyPending = false;
+    for (let i = 0; i < liveCount; i++) {
+      const name = `${ROSTER_PREFIX}${i}`;
+      if (!ns.serverExists(name)) continue;
+      const currentGB = ns.getServerMaxRam(name);
+      if (currentGB >= tier.targetGB) continue;     // at or above target
+      if (currentGB >= MAX_RAM) continue;            // at game cap
+      anyPending = true;
+      const c = costOfDouble(currentGB);
+      if (c < absCheapestCost) absCheapestCost = c;
+      if (c <= liveSpendCap && c < bestCost) {
+        bestCost = c;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx < 0) {
+      if (!anyPending) {
+        counters["SKIP-tier-met"]++;
+      } else if (absCheapestCost > wallet) {
+        counters["SKIP-funds"]++;
+        if (verbose) {
+          ns.tprint(`SKIP-funds      no scale fits wallet (cheapest $${absCheapestCost.toLocaleString()}, wallet $${wallet.toLocaleString()})`);
+        }
+      } else if (wallet - absCheapestCost < reserveFloor) {
+        // The cheapest scale would drop us below the reserve
+        // floor. SKIP-reserve and let the wallet grow.
+        counters["SKIP-reserve"]++;
+        if (verbose) {
+          ns.tprint(`SKIP-reserve     cheapest scale $${absCheapestCost.toLocaleString()} would leave wallet=$${(wallet - absCheapestCost).toLocaleString()} < $${reserveFloor.toLocaleString()}`);
+        }
+      } else {
+        counters["SKIP-rule"]++;
+        if (verbose) {
+          ns.tprint(`SKIP-rule       cheapest scale $${absCheapestCost.toLocaleString()} > ${(ruleFraction * 100).toFixed(0)}% of wallet $${wallet.toLocaleString()}`);
         }
       }
-      if (bestIdx < 0) {
-        if (!anyPending) {
-          counters["SKIP-tier-met"]++;
-        } else if (absCheapestCost > money) {
-          counters["SKIP-funds"]++;
-          if (verbose) {
-            ns.tprint(`SKIP-funds      no scale fits wallet (cheapest $${absCheapestCost.toLocaleString()}, wallet $${money.toLocaleString()})`);
-          }
-        } else {
-          counters["SKIP-rule10"]++;
-          if (verbose) {
-            ns.tprint(`SKIP-rule10     cheapest scale $${absCheapestCost.toLocaleString()} > ${(ruleFraction * 100).toFixed(0)}% of wallet $${money.toLocaleString()}`);
-          }
-        }
-        break;
-      }
+    } else {
       // Apply the cheapest scale: delete + repurchase at 2× RAM.
+      // Check the reserve floor on the ACTUAL scale cost (not
+      // absCheapestCost which might be a different, more expensive
+      // candidate that the rule excluded).
       const targetName = `${ROSTER_PREFIX}${bestIdx}`;
       const currentGB = ns.getServerMaxRam(targetName);
       const newGB = Math.min(currentGB * 2, MAX_RAM);
-      if (!ns.cloud.deleteServer(targetName)) {
+      if (wallet - bestCost < reserveFloor) {
+        counters["SKIP-reserve"]++;
+        if (verbose) {
+          ns.tprint(`SKIP-reserve     scale ${targetName} ${currentGB}GB→${newGB}GB $${bestCost.toLocaleString()} would leave wallet=$${(wallet - bestCost).toLocaleString()} < $${reserveFloor.toLocaleString()}`);
+        }
+      } else if (!ns.cloud.deleteServer(targetName)) {
         counters["FAIL-deleteServer"]++;
         if (verbose) {
           ns.tprint(`FAIL-deleteServer  ${targetName} (running scripts? RAM in use?)`);
         }
-        // Don't break — try the next candidate. But a deleteServer
-        // failure usually means scripts are pinned to the server;
-        // one failure tends to cascade, so we break to be safe.
-        break;
-      }
-      const result = ns.cloud.purchaseServer(targetName, newGB);
-      if (result === "") {
-        counters["FAIL-purchaseAfterDelete"]++;
-        if (verbose) {
-          ns.tprint(`FAIL-purchaseAfterDelete  ${targetName} ${newGB}GB (slot re-taken? race?)`);
+        // Don't continue — a deleteServer failure usually means
+        // scripts are pinned to the server; one failure tends to
+        // cascade, so we stop the pass here.
+      } else {
+        const result = ns.cloud.purchaseServer(targetName, newGB);
+        if (result === "") {
+          counters["FAIL-purchaseAfterDelete"]++;
+          if (verbose) {
+            ns.tprint(`FAIL-purchaseAfterDelete  ${targetName} ${newGB}GB (slot re-taken? race?)`);
+          }
+        } else {
+          counters["SCALED"]++;
+          // Push worker scripts to the re-purchased (scaled) server.
+          // Same reasoning as PSERV-BOUGHT — the delete+recreate wipes
+          // the file system on the pserv, so workers can't run on it
+          // until we re-scp them.
+          if (!pushWorkerScripts(result)) {
+            counters["FAIL-scp"] = (counters["FAIL-scp"] || 0) + 1;
+            if (verbose) ns.tprint(`FAIL-scp        ${result} (couldn't push worker scripts after scale)`);
+          }
+          if (verbose) {
+            ns.tprint(`SCALED          ${result}  ${currentGB}GB → ${newGB}GB for $${bestCost.toLocaleString()}`);
+          }
         }
-        // We've already lost the old server; bail and let the next
-        // tick re-evaluate. No point continuing to spend a wallet
-        // that just lost a server's worth of value.
-        break;
-      }
-      counters["SCALED"]++;
-      // Push worker scripts to the re-purchased (scaled) server.
-      // Same reasoning as PSERV-BOUGHT — the delete+recreate wipes
-      // the file system on the pserv, so workers can't run on it
-      // until we re-scp them.
-      if (!pushWorkerScripts(result)) {
-        counters["FAIL-scp"] = (counters["FAIL-scp"] || 0) + 1;
-        if (verbose) ns.tprint(`FAIL-scp        ${result} (couldn't push worker scripts after scale)`);
-      }
-      if (verbose) {
-        ns.tprint(`SCALED          ${result}  ${currentGB}GB → ${newGB}GB for $${bestCost.toLocaleString()}`);
       }
     }
 

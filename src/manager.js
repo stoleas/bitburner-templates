@@ -1,24 +1,45 @@
 /** @param {NS} ns */
 //
-// manager.js — centralized HWGW orchestrator.
+// manager.js — centralized HWGW orchestrator (fleet-batcher edition).
 //
 // Runs forever on home. Every TICK_MS:
 //
-//   1. For each target in TARGETS (in order), call planBatch() to get
-//      the 4-job plan with timing offsets.
+//   1. For each target in the top MAX_TARGETS pickTargets() returns,
+//      call planBatch() to get the 4-job plan with timing offsets.
 //
-//   2. For each of the 4 jobs, find a worker with enough free RAM via
-//      findWorkerWithRam() and ns.exec() the corresponding single-op
-//      script with the right thread count and delay. Skip the job if
-//      no worker has room (we'll retry next tick).
+//   2. Check the 5% headroom rule: only fire the batch if its total
+//      RAM fits in the fleet's free RAM with 5% headroom. If it
+//      doesn't, SKIP-ram and try the next target (or wait a tick).
 //
-//   3. Multi-target staggering: each target's arrivalT is offset by
-//      `target_index * batchInterval` so the regrow timers don't all
+//   3. Fire the 4 jobs of the batch with their correct delays via
+//      allocate() — the fleet-batcher spreads each job's threads
+//      across home + pservs + rooted-world-servers so the whole
+//      batch's RAM doesn't need to fit on any single host. The
+//      per-job delays are computed against the batch's arrivalT
+//      and the per-target stagger (ti * BATCH_INTERVAL_MS).
+//
+//   4. Multi-target staggering: each target's arrivalT is offset by
+//      `ti * BATCH_INTERVAL_MS` so the regrow timers don't all
 //      bunch on the same wall-clock moment.
 //
-//   4. The orchestrator's own RAM footprint is small (~5 GB for the
+//   5. The orchestrator's own RAM footprint is small (~5 GB for the
 //      ns object + script RAM). It does NOT do any hacking itself —
 //      the workers do.
+//
+//   6. Per-target cooldown: re-firing a target whose previous batch
+//      is still in flight produces $0.000 hacks. Gate each tick's
+//      planBatch() on a per-target lastFireMs + (weakenTime + 5s).
+//
+//   7. Recovery mode: when the per-batch weaken thread count is so
+//      large it doesn't fit on a single host, planBatch returns a
+//      1-job weaken-only plan sized to the largest free worker
+//      (Pitfall 23: largest-fit, not smallest-fit). This drains drift
+//      over a few cycles and the plan transitions back to normal
+//      HWGW automatically.
+//
+//   8. Quiet by default — the per-tick summary only goes to the
+//      terminal when an error fires. --verbose re-enables per-tick
+//      detail to the in-game log file.
 //
 // Tuning:
 //
@@ -45,17 +66,33 @@
 //                          game.
 //   BATCH_INTERVAL_MS    — per-target stagger. Default 4000 (4s).
 //                          Should be < (shortest weakenTime / 2).
-//   PER_TARGET_COOLDOWN_MS — minimum time between batch launches
-//                          against the same target. Default is
-//                          the target's own weakenTime + 5s
-//                          buffer, so the previous batch has
-//                          fully landed (hack/grow/weaken all
-//                          returned and security is back at min)
-//                          before the next one fires. This is
-//                          what fixed the "$0.000 hack" symptom
-//                          where re-firing at TICK_MS cadence
-//                          hit targets whose grow was still in
-//                          flight.
+//   COOLDOWN_BUFFER_MS   — safety buffer added on top of a target's
+//                          weakenTime to derive the per-target
+//                          cooldown. 5s covers worker overhead,
+//                          ns.exec scheduling jitter, and a small
+//                          margin for the regrow timer to start
+//                          clean. The actual cooldown is per-target:
+//                          weakenTime varies 5x across the network
+//                          (fast servers ~10s, mid-game ~50-90s),
+//                          so a fixed value would be wrong.
+//
+// Why the fleet (vs. single-host fit):
+//
+//   Before the fleet, every job in a 4-job batch had to fit on a
+//   single host. For a typical BN1 mid-game target (phantasy, max-
+//   hardware), the batch needs ~5,000 grow threads × 1.75 GB = 8.75
+//   TB plus ~70,000 weaken × 1.75 GB = 122 TB. No single pserv (1
+//   TB) or even home (1 TB) fits the 122 TB weaken. Result: home
+//   hosts the entire batch, pservs sit idle, and 122 TB of fleet
+//   capacity is wasted.
+//
+//   With the fleet, each job is bin-packed across home + every
+//   pserv + every rooted world server (CSEC, foodnstuff, etc., ~50
+//   GB total). The 122 TB weaken becomes "1,000 threads on home +
+//   69,000 spread across 11 pservs" — trivially fits, the whole
+//   cluster is engaged. This is the single biggest BN1 mid-game
+//   performance change. Pattern sourced from
+//   skeesler/bitburner-commander/fleet-batcher.js (public domain).
 //
 // Target selection: the manager dynamically picks MAX_TARGETS servers
 // per tick rather than using a hardcoded list. The selection rule:
@@ -75,8 +112,27 @@
 //
 // Usage:
 //   run manager.js
+//   run manager.js --verbose    # per-tick detail in the in-game log
 //
-import { planBatch, listWorkers, findWorkerWithRam, findLargestWorkerWithRam } from "/lib/hwgw.js";
+import {
+  planBatch,
+  listWorkers,
+  findLargestWorkerWithRam,
+  listReachableServers,
+  // Fleet-batcher helpers — the new pattern that spreads one job's
+  // threads across home + pservs + rooted-world-servers instead of
+  // cramming it onto a single host. The 5% headroom rule (use
+  // FLEET_HEADROOM_FRACTION, not 1.0) prevents partial placements.
+  // (findWorkerWithRam is no longer used in normal-mode dispatch —
+  // the fleet batcher replaces it — but kept exported from
+  // lib/hwgw.js for any one-shot tool that still needs single-host
+  // dispatch.)
+  buildFleet,
+  allocateBatch,
+  fleetFree,
+  totalBatchRam,
+  FLEET_DEFAULTS,
+} from "/lib/hwgw.js";
 
 const MAX_TARGETS = 9;
 const MONEY_FRACTION = 0.50;
@@ -93,23 +149,6 @@ const BATCH_INTERVAL_MS = 4_000;
 // varies 5x across the network (fast servers ~10s, mid-game
 // ~50-90s), so a fixed value would be wrong.
 const COOLDOWN_BUFFER_MS = 5_000;
-
-// BFS the network from home. Returns the sorted list of all
-// reachable hostnames (excluding home). Used by pickTargets() to
-// enumerate candidates. We scan every tick because newly-nuked
-// servers should become available immediately.
-function listReachableServers(ns) {
-  const SOURCE = "home";
-  const seen = new Set([SOURCE]);
-  const queue = [SOURCE];
-  while (queue.length > 0) {
-    const h = queue.shift();
-    for (const n of ns.scan(h)) {
-      if (!seen.has(n)) { seen.add(n); queue.push(n); }
-    }
-  }
-  return [...seen].filter((h) => h !== SOURCE).sort();
-}
 
 // Pick the top MAX_TARGETS servers we can actually batch: rooted,
 // have money, and within hack level. Sorted by moneyMax descending
@@ -185,6 +224,19 @@ export async function main(ns) {
     const counters = { planned: 0, launched: 0, "SKIP-ram": 0, "SKIP-root": 0, "SKIP-level": 0, "SKIP-mp": 0, "SKIP-cooldown": 0, "recovery-firing": 0, "enter-recovery": 0, "leave-recovery": 0, "FAIL-exec": 0 };
     const targets = pickTargets(ns);
     const cooldownRemaining = new Map();  // for --verbose: how many ms until each target is eligible
+
+    // Build the fleet ONCE per tick and share it across all targets.
+    // The fleet (home + pservs + rooted-world-servers) is the
+    // worker pool for normal-mode batches. It's rebuilt per-job
+    // inside the per-target loop (Pitfall 6: stale worker lists
+    // produce FAIL-exec after sleeps), but the initial build here
+    // gives us the per-tick "fleetFree()" number for the 5%
+    // headroom gate.
+    //
+    // The fleet is sized off the CURRENT RAM state. As workers
+    // are placed, the fleet's free RAM shrinks. The per-job
+    // buildFleet() inside the loop reads the latest values.
+    const fleet = buildFleet(ns);
 
     for (let ti = 0; ti < targets.length; ti++) {
       const target = targets[ti];
@@ -289,6 +341,12 @@ export async function main(ns) {
       // only). batchLaunched === 1 === plan.jobs.length works the
       // same way. The cooldown still applies so we don't re-fire
       // the recovery weaken too soon.
+      //
+      // For normal-mode batches, batchLaunched === 4 (one per job).
+      // The fleet-batcher pattern (allocateBatch) places threads
+      // across home + pservs + rooted-worlds; the "count" is the
+      // per-job placed count, summed up. If any job is partial,
+      // we treat the whole batch as failed.
       let batchLaunched = 0;
 
       // Track recovery state per target. We only tprint on
@@ -314,43 +372,113 @@ export async function main(ns) {
         // Silent — same reasoning as enter-recovery above.
       }
 
-      for (const job of plan.jobs) {
+      // ----------------------------------------------------------------
+      // Dispatch: split per branch.
+      //
+      // Normal mode → fleet-batcher (allocateBatch). The fleet
+      // is built once per tick (above the targets loop) and shared
+      // across all targets. Each job's threads are bin-packed
+      // across the whole cluster. The 5% headroom rule (gate
+      // below) prevents partial placements.
+      //
+      // Recovery mode → single-host largest-fit
+      // (findLargestWorkerWithRam). Recovery is weaken-only with
+      // a thread count that fits the largest free worker; the
+      // point is to drain drift as fast as possible, NOT to
+      // spread across the fleet. Spreading a 8000-thread weaken
+      // across 11 pservs would put 727 threads on each 1 TB
+      // pserv, but the cluster could fit a single 8000-thread
+      // weaken on home (1+ TB free), draining 8× the drift per
+      // batch. See Pitfall 23.
+      // ----------------------------------------------------------------
+      if (plan.recoveryMode) {
+        // Recovery: same single-host-largest-fit logic as before.
+        // Sleep the full jobDelay (no Math.min cap) so the
+        // recovery weaken lands at its planned time, even on
+        // slow targets (weakenTime up to 90s + the targetOffset
+        // stagger). The Math.min cap was the Pitfall 1 bug.
+        const job = plan.jobs[0];
         const jobDelay = job.delayMs + targetOffset;
-        // Sleep until it's time to launch THIS job. We cap the
-        // sleep at TICK_MS so we always re-check the world state
-        // at the next tick boundary.
         if (jobDelay > 0) {
-          await ns.sleep(Math.min(jobDelay, TICK_MS));
+          await ns.sleep(jobDelay);
         }
-        // Recheck workers after sleep (state may have changed).
         const workers = listWorkers(ns);
         const ramPerThread = ns.getScriptRam(job.script, "home");
         const need = job.threads * ramPerThread;
-        // Recovery mode uses the LARGEST fit: recovery wants to
-        // drain drift as fast as possible, so it picks the
-        // biggest free worker (typically home with 1+ TB) instead
-        // of the smallest-fit pserv (which would only get a 1.8
-        // GB worker and drain 0.05 sec per batch — would take
-        // thousands of batches to clear typical drift). For
-        // normal mode, use the regular smallest-fit rule so
-        // small batches spread across the pserv fleet.
-        const w = plan.recoveryMode
-          ? findLargestWorkerWithRam(ns, workers, need)
-          : findWorkerWithRam(ns, workers, need);
+        const w = findLargestWorkerWithRam(ns, workers, need);
         if (!w) { counters["SKIP-ram"]++; continue; }
         const pid = ns.exec(job.script, w, job.threads, target);
         if (pid === 0) { counters["FAIL-exec"]++; continue; }
         counters.launched++;
-        batchLaunched++;
-        // Per-job trace: silent by default. Only fires under
-        // --verbose (so the in-game log file shows the per-job
-        // detail during debugging). The user explicitly does not
-        // want per-job lines on the terminal during normal
-        // operation. The success path is silent; the failure
-        // path (counters.FAIL-exec above) is captured in the
-        // error-only tprint.
+        batchLaunched = 1;
         if (verbose) {
-          ns.print(`manager: ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+          ns.print(`manager: RECOVERY ${job.script} → ${w} target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+        }
+      } else {
+        // Normal mode: 5% headroom gate. The fleet-batcher
+        // *will* partially place a batch that's too big, leaving
+        // a partial hack without a matching grow — the target
+        // would drain to $0 and never refill. The gate rejects
+        // any batch whose total RAM doesn't fit in the fleet's
+        // 95% free window, so partial placements never happen
+        // in practice. (Sourced from skeesler/bitburner-commander.)
+        const batchRam = totalBatchRam(ns, plan);
+        const free = fleetFree(ns, fleet);
+        if (batchRam > free * FLEET_DEFAULTS.FLEET_HEADROOM_FRACTION) {
+          // The batch would partial-place. SKIP-ram and let the
+          // next tick try again (the fleet may have more free
+          // RAM after the previous tick's workers returned).
+          counters["SKIP-ram"]++;
+          if (verbose) {
+            ns.print(`manager: SKIP-fleet-fit target=${target} batch=${batchRam.toFixed(0)}GB fleetFree=${free.toFixed(0)}GB`);
+          }
+          continue;
+        }
+        // Fire the 4 jobs back-to-back via the fleet. Per-job
+        // sleeps are computed inside allocateBatch (it adds
+        // targetOffset to each job's delayMs) — actually no,
+        // allocateBatch does NOT sleep; it just calls ns.exec
+        // for each job in order. The sleeps are done HERE so the
+        // timing invariant ("all 4 jobs land at arrivalT") is
+        // preserved. Sleep the FULL jobDelay (no Math.min cap,
+        // the Pitfall 1 fix).
+        for (const job of plan.jobs) {
+          const jobDelay = job.delayMs + targetOffset;
+          if (jobDelay > 0) {
+            await ns.sleep(jobDelay);
+          }
+          // Recheck fleet right before exec (Pitfall 6: stale
+          // worker list → stale "yes this has room" answers).
+          // We rebuild the fleet rather than relying on the
+          // cached one from the top of the tick — another
+          // monitor may have claimed RAM during our sleeps.
+          const freshFleet = buildFleet(ns);
+          const placed = allocateBatch(
+            ns, freshFleet,
+            // Wrap the single job in a 1-element plan so we can
+            // reuse allocateBatch's logic. (allocateBatch fires
+            // all 4 jobs in one call; we use it per-job here
+            // so the per-job sleep lands at the right moment.)
+            { jobs: [job], totalRam: job.threads * ns.getScriptRam(job.script, "home") },
+            target, 0 /* targetOffset already in jobDelay */,
+            Date.now(),  // id = wall-clock ms; distinguishes this batch from previous
+            verbose
+          );
+          if (placed.minPlaced < job.threads) {
+            // Partial placement (shouldn't happen with the 5%
+            // gate above, but defensive).
+            const short = job.threads - placed.minPlaced;
+            counters["SKIP-ram"] += short;
+            if (verbose) {
+              ns.print(`manager: SKIP-fleet-partial target=${target} ${job.script} placed=${placed.minPlaced}/${job.threads}`);
+            }
+            continue;
+          }
+          counters.launched++;
+          batchLaunched++;
+          if (verbose) {
+            ns.print(`manager: ${job.script} → fleet target=${target} threads=${job.threads} delay=${jobDelay}ms`);
+          }
         }
       }
 

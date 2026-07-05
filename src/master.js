@@ -43,7 +43,21 @@
 //   monitor-hacknet.js    (60s, no args)
 //   monitor-buy.js        (30s, no args)
 //   monitor-servers.js    (60s, no args)  — fills the pserv fleet in lockstep with wallet
-//   manager.js            (60s, no args)  — HWGW orchestrator that USES the fleet
+//                                            (1-to-3 Rule + $100B reserve floor, conservative spend)
+//   manager.js            (60s, no args)  — HWGW orchestrator that USES the fleet (fleet-batcher:
+//                                            spreads one job's threads across home + pservs +
+//                                            rooted-worlds, no single-host fit required)
+//
+// monitor-servers.js was the largest source of wallet drain before
+// the fleet-batcher integration. The conservative defaults
+// (--rule 0.03, --reserve 100e9, one buy + one scale per pass)
+// were added because the previous defaults (10% of wallet per
+// purchase, no reserve floor, multi-server scale walks) drained
+// $1.5B+ of wallet against an $8.7M income run. To re-enable
+// 4 TB pservs (the previous "soft-cap" tier, costing ~$1.15T for
+// 5 servers), pass `--tier soft-cap` explicitly. The 1 TB sweet
+// spot is plenty for the fleet-batcher, which uses home + pservs
+// + rooted world servers (CSEC, foodnstuff, etc.) as workers.
 //
 // NOTE: monitor-sync.js is intentionally NOT in this list. The 30s
 // auto-loop that re-runs sync-all.js across the whole reachable
