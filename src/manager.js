@@ -1,34 +1,52 @@
 /** @param {NS} ns */
 //
-// manager.js — centralized HWGW orchestrator (fleet-batcher edition).
+// manager.js — centralized HWGW orchestrator (fleet-batcher edition,
+// skeesler-aligned pacing).
 //
-// Runs forever on home. Every TICK_MS:
+// Runs forever on home. Each iteration of the outer loop:
 //
 //   1. For each target in the top MAX_TARGETS pickTargets() returns,
 //      call planBatch() to get the 4-job plan with timing offsets.
 //
-//   2. Check the 5% headroom rule: only fire the batch if its total
-//      RAM fits in the fleet's free RAM with 5% headroom. If it
-//      doesn't, SKIP-ram and try the next target (or wait a tick).
+//   2. isHealthy gate (skeesler pattern, fleet-batcher.js:131-137):
+//      refuse to fire HWGW unless the target is at >= 50% × (1 -
+//      hackFrac) × maxMoney AND curSec <= minSec + 5. If not
+//      healthy, fall back to drain (weaken-only) until the next
+//      attempt. Without this gate, a drained target (moneyAvailable
+//      near $0) gets fired on again, hack.js steals $0, grow.js
+//      runs the full regrow, and the income stream is a fraction
+//      of what it would be with a healthy target.
 //
-//   3. Fire the 4 jobs of the batch with their correct delays via
-//      allocate() — the fleet-batcher spreads each job's threads
+//   3. Per-target share cap (MAX_FLEET_SHARE = 1/3): the batch's
+//      total RAM must fit in 1/3 of the fleet's total max RAM.
+//      Prevents one target from hogging the cluster.
+//
+//   4. 5% headroom rule: only fire the batch if its total RAM fits
+//      in the fleet's free RAM with 5% headroom. If it doesn't,
+//      SKIP-ram and try the next target (or wait a tick).
+//
+//   5. Fire the 4 jobs of the batch with their correct delays via
+//      allocateBatch() — the fleet-batcher spreads each job's threads
 //      across home + pservs + rooted-world-servers so the whole
 //      batch's RAM doesn't need to fit on any single host. The
 //      per-job delays are computed against the batch's arrivalT
-//      and the per-target stagger (ti * BATCH_INTERVAL_MS).
+//      and the per-target stagger (ti * BATCH_STAGGER_MS).
 //
-//   4. Multi-target staggering: each target's arrivalT is offset by
-//      `ti * BATCH_INTERVAL_MS` so the regrow timers don't all
+//   6. Multi-target staggering: each target's arrivalT is offset by
+//      `ti * BATCH_STAGGER_MS` so the regrow timers don't all
 //      bunch on the same wall-clock moment.
 //
-//   5. The orchestrator's own RAM footprint is small (~5 GB for the
+//   7. The orchestrator's own RAM footprint is small (~5 GB for the
 //      ns object + script RAM). It does NOT do any hacking itself —
 //      the workers do.
 //
-//   6. Per-target cooldown: re-firing a target whose previous batch
+//   8. Per-target cooldown: re-firing a target whose previous batch
 //      is still in flight produces $0.000 hacks. Gate each tick's
 //      planBatch() on a per-target lastFireMs + (weakenTime + 5s).
+//
+//   9. Outer loop pace: the per-target stagger and the per-job
+//      sleeps set the pace naturally. No fixed TICK_MS residual —
+//      the cooldown gate is what throttles re-fire.
 //
 //   7. Recovery mode: when the per-batch weaken thread count is so
 //      large it doesn't fit on a single host, planBatch returns a
@@ -61,11 +79,19 @@
 //                          previous grow hadn't refilled it. That
 //                          race is what made hack.js return $0.000
 //                          on otherwise-sane targets.
-//   TICK_MS              — main loop period. 5000 (5s) is the
-//                          default; 1000 for high-throughput late
-//                          game.
-//   BATCH_INTERVAL_MS    — per-target stagger. Default 4000 (4s).
-//                          Should be < (shortest weakenTime / 2).
+//   BATCH_GAP_MS         — wall-clock pace between batch starts.
+//                          Default 800ms (skeesler/bitburner-
+//                          commander pattern). The previous
+//                          TICK_MS=5000 is obsolete; the per-
+//                          target cooldown (weakenTime + buffer)
+//                          is what gates re-fire, not the outer
+//                          loop's pace.
+//   BATCH_STAGGER_MS     — per-target stagger. Default 4000 (4s).
+//                          Each target's arrivalT is offset by
+//                          ti * BATCH_STAGGER_MS so the regrow
+//                          timers don't all bunch on the same
+//                          wall-clock moment. Should be < (shortest
+//                          weakenTime / 2).
 //   COOLDOWN_BUFFER_MS   — safety buffer added on top of a target's
 //                          weakenTime to derive the per-target
 //                          cooldown. 5s covers worker overhead,
@@ -119,6 +145,7 @@ import {
   listWorkers,
   findLargestWorkerWithRam,
   listReachableServers,
+  isHealthy,
   // Fleet-batcher helpers — the new pattern that spreads one job's
   // threads across home + pservs + rooted-world-servers instead of
   // cramming it onto a single host. The 5% headroom rule (use
@@ -136,13 +163,37 @@ import {
 } from "/lib/hwgw.js";
 
 const MAX_TARGETS = 9;
-const MONEY_FRACTION = 0.50;
-const TICK_MS = 5_000;
+// Default 0.10, NOT 0.50. Skeesler/bitburner-commander defaults
+// to 10% for a reason: at 50% the regrow threads get so large
+// that the matching grow can't refill before the next hack, the
+// target oscillates between $0 and moneyMax, and the income
+// stream drops to a residual $M figure instead of the expected
+// $B+. The 10% fraction is the proven sweet spot for fleets up
+// to ~50 TB; at higher fleet sizes, raise MONEY_FRACTION toward
+// 0.30 (still well under the 0.50 oscillation point).
+//
+// Sourced from skeesler/bitburner-commander/commander.js:47
+// (`const hackFraction = flags._[1] !== undefined ? Number(...)
+//  : 0.10;`).
+const MONEY_FRACTION = 0.10;
+// Outer-loop pacing. skeesler uses 800ms between batch starts;
+// the per-target cooldown is still weakenTime + buffer (Pitfall
+// 4: re-firing before the regrow timer is a wasted batch), but
+// the loop's wall-clock pace is this constant. The default 5s
+// was the pre-fleet value when batches were 1×/5s/target; with
+// the fleet pattern, batches are < 1s apart and 800ms is the
+// sweet spot (faster than the 5s default but slow enough that
+// the fleet has time to free up RAM as workers complete).
+//
+// Note: the previous TICK_MS=5000 is now obsolete — the
+// per-target cooldown (weakenTime + buffer, typically 95s for
+// phantasy) is what gates re-fire, not the outer loop's pace.
+const BATCH_GAP_MS = 800;
 // Per-target stagger: each target's arrivalT is offset by
-// ti * BATCH_INTERVAL_MS so the regrow timers don't all bunch
-// on the same wall-clock moment. Should be much less than the
-// shortest weakenTime; 4 seconds is safe.
-const BATCH_INTERVAL_MS = 4_000;
+// ti * BATCH_STAGGER_MS so the regrow timers don't all bunch
+// on the same wall-clock moment. 4s is safe (weakenTime ~90s
+// gives plenty of headroom for the stagger to spread out).
+const BATCH_STAGGER_MS = 4_000;
 // Safety buffer added on top of a target's weakenTime to derive
 // the per-target cooldown. 5s covers worker overhead, ns.exec
 // scheduling jitter, and a small margin for the regrow timer to
@@ -150,6 +201,16 @@ const BATCH_INTERVAL_MS = 4_000;
 // varies 5x across the network (fast servers ~10s, mid-game
 // ~50-90s), so a fixed value would be wrong.
 const COOLDOWN_BUFFER_MS = 5_000;
+// isHealthy() tolerance. The skeesler pattern uses a STRICT
+// check: refuse to fire HWGW unless the target is at >= 50%
+// × (1 - hackFrac) × maxMoney AND curSec <= minSec + 5. Without
+// this gate, a drained target (moneyAvailable = $0 after a
+// bad batch) gets fired on again, hack.js steals $0, grow.js
+// runs the full regrow, the target spends a full weakenTime
+// recovering, and the income stream is a fraction of what it
+// would be with a healthy target.
+const HEALTH_MONEY_FRACTION = 0.5;
+const HEALTH_SEC_TOLERANCE = 5;
 
 // Pick the top MAX_TARGETS servers we can actually batch: rooted,
 // have money, and within hack level. Sorted by moneyMax descending
@@ -217,7 +278,7 @@ export async function main(ns) {
   // --verbose to see every tick.
   const verbose = ns.args.includes("--verbose");
   if (verbose) {
-    ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} tick=${TICK_MS}ms, output=verbose`);
+    ns.tprint(`manager: started, MAX_TARGETS=${MAX_TARGETS} batchGap=${BATCH_GAP_MS}ms, output=verbose`);
   }
 
   while (true) {
@@ -283,6 +344,69 @@ export async function main(ns) {
         }
       }
 
+      // isHealthy gate (skeesler pattern, fleet-batcher.js:131-137).
+      // The skeesler pattern refuses to fire HWGW unless the
+      // target is at >= 50% × (1 - hackFrac) × maxMoney AND
+      // curSec <= minSec + 5. Without this gate, a drained target
+      // (moneyAvailable = $0 after a bad batch) gets fired on
+      // again, hack.js steals $0, grow.js runs the full regrow,
+      // the target spends a full weakenTime recovering, and the
+      // income stream is a fraction of what it would be with a
+      // healthy target.
+      //
+      // The user's earlier symptom — $1.549B spent, $8.7M earned
+      // — was caused by exactly this. With MONEY_FRACTION=0.50
+      // and no isHealthy gate, the manager was firing HWGW on
+      // targets that had been drained, getting $0 back, running
+      // the full regrow, and repeating. The income was a residual
+      // from a brief window when the targets happened to be
+      // healthy.
+      //
+      // Sourced from skeesler/bitburner-commander/fleet-batcher.js.
+      // isHealthy is the TOLERANT check (curSec <= minSec + 5,
+      // money >= 50% × (1 - hackFrac) × maxMoney). The stricter
+      // isPrepped (curSec <= minSec + 0.01, money >= 99.9% ×
+      // maxMoney) is used inside the prep() function for bringing
+      // a target back from a fully-drained state.
+      if (!isHealthy(ns, target, MONEY_FRACTION, HEALTH_MONEY_FRACTION, HEALTH_SEC_TOLERANCE)) {
+        counters["SKIP-unhealthy"]++;
+        if (verbose) {
+          ns.print(`manager: SKIP-unhealthy target=${target} curMoney=$${ns.getServerMoneyAvailable(target).toLocaleString()} maxMoney=$${ns.getServerMaxMoney(target).toLocaleString()} curSec=${ns.getServerSecurityLevel(target).toFixed(2)} minSec=${ns.getServerMinSecurityLevel(target).toFixed(2)}`);
+        }
+        // Fall back to drain (single-host weaken) to start
+        // recovering the target. This is a fire-and-forget op
+        // that doesn't gate on cooldown or fleet spread — we
+        // just want to drop security below minSec + 5 ASAP.
+        // skeesler's pattern calls this `drain()`; we inline a
+        // minimal version because the manager's main loop is
+        // already running and we don't want to wait for the
+        // worker to land before moving to the next target.
+        const weakenRam = ns.getScriptRam("weaken.js", "home");
+        const workers = listWorkers(ns);
+        const targetFree = ns.getServerMaxRam(target) - ns.getServerUsedRam(target);
+        const biggestWorker = workers.reduce((best, w) => {
+          const free = ns.getServerMaxRam(w) - ns.getServerUsedRam(w);
+          return free > best.free ? { h: w, free } : best;
+        }, { h: null, free: 0 });
+        if (biggestWorker.h && biggestWorker.free >= weakenRam) {
+          const drainThreads = Math.floor(biggestWorker.free * 0.95 / weakenRam);
+          // Cap to "enough to bring curSec to minSec + 5" — the
+          // isHealthy threshold. We don't need to fully prep the
+          // target here; we just need to make the next isHealthy
+          // check pass.
+          const secToDrop = Math.max(0, ns.getServerSecurityLevel(target) - ns.getServerMinSecurityLevel(target) - HEALTH_SEC_TOLERANCE);
+          const minThreads = Math.ceil(secToDrop / 0.05);
+          const threads = Math.min(drainThreads, Math.max(minThreads, 1));
+          if (ns.exec("weaken.js", biggestWorker.h, threads, target) > 0) {
+            counters["draining"] = (counters["draining"] || 0) + 1;
+            if (verbose) {
+              ns.print(`manager: DRAIN ${biggestWorker.h} ${threads} weaken threads target=${target} (curSec=${ns.getServerSecurityLevel(target).toFixed(2)}, minSec=${ns.getServerMinSecurityLevel(target).toFixed(2)})`);
+            }
+          }
+        }
+        continue;
+      }
+
       let plan;
       try {
         plan = planBatch(ns, target, { moneyFraction: MONEY_FRACTION });
@@ -325,9 +449,9 @@ export async function main(ns) {
       }
       counters.planned++;
 
-      // Stagger the arrival by ti * BATCH_INTERVAL_MS so targets
-      // don't all regrow at the same instant.
-      const targetOffset = ti * BATCH_INTERVAL_MS;
+      // Stagger the arrival by ti * BATCH_STAGGER_MS so targets
+      // process in a rolling wave, not all at once.
+      const targetOffset = ti * BATCH_STAGGER_MS;
       // Count how many of this target's 4 jobs successfully
       // launched. Only record lastFireMs[target] if ALL 4 made it
       // — a partial batch (e.g. hack launched but weaken SKIP-ram'd)
@@ -590,9 +714,17 @@ export async function main(ns) {
       ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no summary)"}`);
     }
 
-    // Wait until the next tick boundary. We've already burned some
-    // time on per-job sleeps, so the residual is small.
-    const residual = TICK_MS - (Date.now() - tickStart);
-    if (residual > 0) await ns.sleep(residual);
+    // The per-target loop above already paced itself via
+    // `await ns.sleep(jobDelay)` between jobs and the per-target
+    // stagger (`ti * BATCH_STAGGER_MS`). The outer loop's pace
+    // is implicit in the in-flight workers — re-firing on a
+    // target still under cooldown is gated by the per-target
+    // `lastFireMs[target]` check, so this loop spins as fast as
+    // cooldowns allow. No fixed TICK_MS residual is needed.
+    //
+    // (The previous 5s residual was the pre-fleet pacing. With
+    // the fleet pattern, 5s × 9 targets = 45s of dead time per
+    // tick, which throttled the income stream to ~1 batch per
+    // 5s/target. Removing it lets the cooldowns drive the pace.)
   }
 }

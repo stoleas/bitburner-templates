@@ -586,12 +586,15 @@ export function isPrepped(ns, target) {
  * (1 - hackFraction), the grow isn't keeping up and the target
  * is desynced.
  */
-export function isHealthy(ns, target, hackFraction) {
+export function isHealthy(ns, target, hackFraction, moneyFraction = 0.5, secTolerance = 5) {
   const maxMoney = ns.getServerMaxMoney(target);
   const minSec = ns.getServerMinSecurityLevel(target);
   const money = ns.getServerMoneyAvailable(target);
   const sec = ns.getServerSecurityLevel(target);
-  return money >= maxMoney * (1 - hackFraction) * 0.5 && sec <= minSec + 5;
+  // skeesler default: money >= 50% × (1 - hackFraction) × maxMoney
+  // AND curSec <= minSec + 5. Caller can override the money fraction
+  // (e.g. a stricter check) or the sec tolerance.
+  return money >= maxMoney * (1 - hackFraction) * moneyFraction && sec <= minSec + secTolerance;
 }
 
 /**

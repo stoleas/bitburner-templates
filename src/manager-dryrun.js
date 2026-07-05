@@ -20,8 +20,10 @@
 //
 //   manager-dryrun: planning batches (no launches)
 //   manager-dryrun: cluster=N servers, total=NGGB, free=NGGB
-//     phantasy        target=phantasy hack=N w=N grow=N ram=NGGB fleet=[home:N, pserv-0:N, ...]
-//     omega-net       target=omega-net hack=N w=N grow=N ram=NGGB fleet=[...]
+//     phantasy        target=phantasy OK healthy money=0.99×max sec=100.0/100.0
+//                     hack=N w=N grow=N ram=NGGB pipe=N fleet=[home:N, pserv-0:N, ...]
+//     omega-net       target=omega-net UNHEALTHY money=0.00×max sec=100.0/100.0
+//                     (will drain before normal HWGW)
 //     ...
 //
 // Usage:
@@ -33,6 +35,9 @@ import {
   buildFleet,
   fleetFree,
   totalBatchRam,
+  shareRamCap,
+  isHealthy,
+  isPrepped,
   FLEET_DEFAULTS,
 } from "/lib/hwgw.js";
 
@@ -79,7 +84,8 @@ export async function main(ns) {
   // the same fleet shape.
   const fleet = buildFleet(ns);
   const fleetFreeRam = fleetFree(ns, fleet);
-  ns.tprint(`manager-dryrun: fleet=${fleet.length} hosts, fleetFree=${fleetFreeRam.toFixed(0)}GB`);
+  const shareCap = shareRamCap(ns, fleet);
+  ns.tprint(`manager-dryrun: fleet=${fleet.length} hosts, fleetFree=${fleetFreeRam.toFixed(0)}GB, shareCap=${shareCap.toFixed(0)}GB (1/3)`);
 
   // Pull script RAM costs once; same as totalBatchRam() does.
   const hackRam = ns.getScriptRam("hack.js", "home");
@@ -102,9 +108,23 @@ export async function main(ns) {
       ns.tprint(`  ${target.padEnd(20)}  SKIP  moneyMax=0`);
       continue;
     }
+    // isHealthy/isPrepped diagnostic. The production manager
+    // refuses to fire HWGW on unhealthy targets — the dryrun
+    // shows the live state so you can see WHICH targets need
+    // drain/prep before normal HWGW resumes.
+    const healthy = isHealthy(ns, target, 0.10, 0.5, 5);
+    const prepped = isPrepped(ns, target);
+    const healthTag = prepped ? "PREPPED" : (healthy ? "OK" : "UNHEALTHY");
+    const healthDetail = `money=${(s.moneyAvailable / Math.max(1, s.moneyMax)).toFixed(2)}×max sec=${s.hackDifficulty.toFixed(1)}/${s.minDifficulty.toFixed(1)}`;
     try {
       const plan = planBatch(ns, target, { moneyFraction: 0.10 });
       const batchRam = totalBatchRam(ns, plan);
+      // Pipe depth: how many batches can run in parallel given
+      // the per-target share cap. From skeesler/bitburner-commander:
+      // `concurrent = floor(shareCap / batchRam)`. Each batch takes
+      // 1 weakenTime to complete; the pipe lets the cluster fire
+      // `concurrent` batches over the same wall-clock window.
+      const pipe = batchRam > 0 ? Math.max(1, Math.floor(shareCap / batchRam)) : 1;
       const fit = batchRam <= fleetFreeRam * FLEET_DEFAULTS.FLEET_HEADROOM_FRACTION;
       // Show the per-job fleet spread. Hack and grow are usually
       // small enough to fit on home; weaken is the job that
@@ -121,9 +141,12 @@ export async function main(ns) {
         fleetSummary.push(`${job.script.replace(".js", "")}=[${parts || "none"}]`);
       }
       const fitTag = fit ? "OK" : "SKIP-fleet";
-      ns.tprint(`  ${target.padEnd(20)}  ${plan.summary} ${fitTag} fleet=[${fleetSummary.join(" ")}]`);
+      const pipeTag = `pipe=${pipe}×`;
+      const actionTag = healthy ? "" : " (DRAIN before HWGW)";
+      ns.tprint(`  ${target.padEnd(20)}  ${healthTag.padEnd(10)} ${healthDetail}${actionTag}`);
+      ns.tprint(`  ${"".padEnd(20)}  ${plan.summary} ${pipeTag}${fitTag} fleet=[${fleetSummary.join(" ")}]`);
     } catch (e) {
-      ns.tprint(`  ${target.padEnd(20)}  ERR   ${e.message}`);
+      ns.tprint(`  ${target.padEnd(20)}  ${healthTag.padEnd(10)} ${healthDetail}  ERR   ${e.message}`);
     }
   }
 }
