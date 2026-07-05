@@ -714,17 +714,27 @@ export async function main(ns) {
       ns.tprint(`manager: targets=[${targets.join(",") || "(empty)"}] ${summary || "(no summary)"}`);
     }
 
-    // The per-target loop above already paced itself via
-    // `await ns.sleep(jobDelay)` between jobs and the per-target
-    // stagger (`ti * BATCH_STAGGER_MS`). The outer loop's pace
-    // is implicit in the in-flight workers — re-firing on a
-    // target still under cooldown is gated by the per-target
-    // `lastFireMs[target]` check, so this loop spins as fast as
-    // cooldowns allow. No fixed TICK_MS residual is needed.
+    // CRITICAL: pace the outer loop. The per-target loop above
+    // does its own pacing (per-job sleeps, per-target stagger,
+    // per-target cooldown), but the OUTER loop has no natural
+    // delay between iterations. Without a sleep here, the loop
+    // spins at max rate (~1000 iterations/sec) calling
+    // pickTargets (BFS scan of 50+ servers) and re-checking
+    // cooldowns. At that rate, the Web Worker hosting this
+    // script saturates the renderer's event loop and the game
+    // tab becomes unresponsive — what the user observed as
+    // "the game crashed". (The save state is fine; the tab
+    // just hangs until the worker is killed.)
     //
-    // (The previous 5s residual was the pre-fleet pacing. With
-    // the fleet pattern, 5s × 9 targets = 45s of dead time per
-    // tick, which throttled the income stream to ~1 batch per
-    // 5s/target. Removing it lets the cooldowns drive the pace.)
+    // 1s is the right value: it paces the outer loop without
+    // throttling the income stream. The per-target cooldown
+    // (weakenTime + buffer, typically 95s for phantasy) is
+    // what actually gates re-fire; the 1s outer residual just
+    // keeps the loop from spinning. skeesler uses BATCH_GAP=800ms
+    // between batch starts inside a single-target fleet-batcher
+    // process, but the manager is a single multi-target process
+    // and 1s between full-tick sweeps is the right call.
+    await ns.sleep(1_000);
   }
 }
+
