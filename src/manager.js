@@ -130,6 +130,7 @@ import {
   buildFleet,
   allocateBatch,
   fleetFree,
+  shareRamCap,
   totalBatchRam,
   FLEET_DEFAULTS,
 } from "/lib/hwgw.js";
@@ -431,6 +432,23 @@ export async function main(ns) {
           counters["SKIP-ram"]++;
           if (verbose) {
             ns.print(`manager: SKIP-fleet-fit target=${target} batch=${batchRam.toFixed(0)}GB fleetFree=${free.toFixed(0)}GB`);
+          }
+          continue;
+        }
+        // Per-target share cap (MAX_FLEET_SHARE = 1/3): no single
+        // target can claim more than 1/3 of the fleet's total
+        // capacity for one batch. Without this gate, the top-
+        // ranked target by moneyMax (phantasy) consumes the whole
+        // cluster on every tick and targets #2..#9 starve. The
+        // cap is evaluated against the BATCH (4 jobs summed),
+        // not per-job — a single big weaken is fine as long as
+        // the total batch stays under the share. Sourced from
+        // skeesler/bitburner-commander.
+        const shareCap = shareRamCap(ns, fleet);
+        if (batchRam > shareCap) {
+          counters["SKIP-share"] = (counters["SKIP-share"] || 0) + 1;
+          if (verbose) {
+            ns.print(`manager: SKIP-share target=${target} batch=${batchRam.toFixed(0)}GB cap=${shareCap.toFixed(0)}GB (MAX_FLEET_SHARE=${FLEET_DEFAULTS.MAX_FLEET_SHARE})`);
           }
           continue;
         }

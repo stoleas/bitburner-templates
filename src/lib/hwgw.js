@@ -29,8 +29,10 @@ const HOME_HEADROOM_GB = 32;
 // fleet-batcher-pattern ref in bitburner-dev skill.
 const FLEET_HEADROOM_FRACTION = 0.95;
 
-// Cap on a single target's fleet share. Without this, the top-
-// ranked target takes the whole cluster and other targets starve.
+// Cap on a single target's fleet share. Enforced in manager.js
+// (per-target share gate, see shareRamCap in this file). Without
+// this, the top-ranked target by moneyMax (phantasy) consumes
+// the whole cluster on every tick and targets #2..#9 starve.
 // Sourced from skeesler/bitburner-commander (MAX_FLEET_SHARE = 1/3).
 const MAX_FLEET_SHARE = 1 / 3;
 
@@ -186,11 +188,28 @@ export function planBatch(ns, target, opts) {
   ];
   const totalRam = jobs.reduce((sum, j) => sum + ramByScript[j.script] * j.threads, 0);
 
-  // Find the largest single worker's free RAM. listWorkers() returns
-  // ["home", "pserv-0", ...] in the order Bitburner uses. home is
-  // typically the largest, but we measure free RAM (max - used) per
-  // worker because a pserv might have a big job running. The largest
-  // free-RAM worker is the one most likely to fit a recovery batch.
+  // Build the fleet and check if the fleet can carry the biggest job.
+  // This is the FLEET-AWARE check — it asks "can the cluster as a
+  // whole fit the largest single op?" instead of "can any single
+  // host fit it?". The old single-host check was the right rule
+  // before the fleet-batcher existed; with the fleet, it's too
+  // conservative (busy pservs look full but the fleet has spare
+  // capacity from rooted worlds + idle home).
+  //
+  // Per-target cap: 1/3 of the fleet. Matches skeesler's
+  // MAX_FLEET_SHARE; one target's biggest job must fit in its
+  // share of the cluster. Without the cap, one huge target could
+  // claim the whole fleet and starve the others.
+  const fleet = buildFleet(ns);
+  const totalFleetFree = fleetFree(ns, fleet);
+  const perTargetFleetCap = totalFleetFree * FLEET_DEFAULTS.MAX_FLEET_SHARE;
+  // Also compute the single-host largest-free as a fallback for the
+  // recovery plan's "sized to the biggest single host" sizing
+  // (see below). Recovery uses the same single-host sizing as
+  // before because the recovery weaken is a single op, not a batch
+  // — we can either spread it across the fleet OR fit it on one
+  // host, but spreading is the new path. Keep the old single-host
+  // sizing as a per-batch upper bound for the recovery plan.
   let largestFreeRam = 0;
   for (const w of listWorkers(ns)) {
     const free = ns.getServerMaxRam(w) - ns.getServerUsedRam(w);
@@ -198,21 +217,31 @@ export function planBatch(ns, target, opts) {
   }
 
   // The full batch's bottleneck is the LARGEST single job (usually
-  // one of the two weakens). If that single job doesn't fit, we go
-  // into recovery mode. We check per-job (not total) because the
-  // manager fires each job on a different worker — total > freeRam
-  // is fine if the work is split, but a single job > largest free
-  // is a hard wall.
+  // one of the two weakens). If the fleet (per-target share) can
+  // carry it, we run a normal HWGW. Otherwise, we drop to recovery
+  // mode (weaken-only, sized to the largest single worker).
   const biggestJobRam = Math.max(
     hackThreads * ramByScript["hack.js"],
     weakenThreads * ramByScript["weaken.js"],
     growThreads * ramByScript["grow.js"],
   );
 
-  if (biggestJobRam > largestFreeRam) {
+  // Fleet-aware check: can the fleet (per-target share) carry the
+  // biggest job? If yes, normal HWGW.
+  // Fallback check: if the fleet is too small (e.g. < 2x the biggest
+  // job), use the single-host check as a sanity gate. The 2x
+  // multiplier is conservative: if the fleet can't carry 2 batches
+  // of the biggest job, it's a single-host operation regardless.
+  const fleetCanCarry = biggestJobRam <= perTargetFleetCap
+    && totalFleetFree >= 2 * biggestJobRam;
+
+  if (!fleetCanCarry) {
     // Recovery mode: weaken-only, sized to the largest free worker.
-    // weakenPerThread × recoverThreads = sec drop per batch.
-    // The threads must fit on `largestFreeRam` minus a 5% safety margin.
+    // The recovery sizing is unchanged from the old single-host
+    // logic — we use the largest single worker's free RAM (not
+    // the fleet) because recovery is a single op and we want
+    // bunching on the biggest host for fastest drift drain.
+    // (Pitfall 23: largest-fit for recovery, smallest-fit for normal.)
     const safetyMargin = 0.95;
     const recoverThreads = Math.max(
       1,
@@ -450,10 +479,48 @@ export function allocate(ns, fleet, script, threads, target, delay, id) {
 }
 
 /**
+ * Maximum RAM (in GB) a single target's batch can claim from the
+ * fleet, per the MAX_FLEET_SHARE cap. The cap is the per-target
+ * share of the fleet's TOTAL max RAM (not free — total), so a
+ * single target can't hog more than 1/3 of the cluster's capacity
+ * for one batch.
+ *
+ * Sourced from skeesler/bitburner-commander: their
+ * MAX_FLEET_SHARE = 1/3 prevents the top-ranked target from
+ * taking the whole cluster and starving #2..#9. Without this
+ * cap, `pickTargets()`'s "first 9 by moneyMax" ordering means
+ * phantasy alone consumes the whole fleet on every tick.
+ *
+ * The fleet's total = sum of (max - reserve) across members.
+ * `reserve` is the per-host system headroom (32 GB on home, 0 on
+ * pservs/rooted worlds). Using max - reserve (not max) means
+ * the cap is "the fleet's usable capacity" not "raw installed
+ * RAM", which matches what the manager actually competes for.
+ *
+ * Cost: O(fleet.size) per call. Negligible — this is called
+ * once per target per tick, not per job.
+ */
+export function shareRamCap(ns, fleet) {
+  let total = 0;
+  for (const { h, r } of fleet) {
+    total += Math.max(0, ns.getServerMaxRam(h) - r);
+  }
+  return Math.floor(total * MAX_FLEET_SHARE);
+}
+
+/**
  * Distribute all 4 jobs of a plan across the fleet, returning the
  * minimum threads-placed across the 4 jobs (0 if any job partial).
  * The caller treats min===0 as "batch failed, don't stamp cooldown"
- * and treats min===4 as "batch fully placed, stamp cooldown."
+ * and treats min===jobs.length as "batch fully placed, stamp cooldown."
+ *
+ * The caller is responsible for share-cap (MAX_FLEET_SHARE) and
+ * fleet-fit (5% headroom) gates BEFORE calling allocateBatch.
+ * allocateBatch is a low-level bin-packer; it does what it's told
+ * within the fleet's current free RAM. Doing the higher-level
+ * gates upstream means the manager can call allocateBatch for
+ * the WHOLE batch (4 jobs in one call) or for a single job (per-
+ * job sleep pattern, manager.js:444-482) with the same API.
  *
  * Workers are pushed to the fleet hosts via ns.scp first so the
  * `Script <name> does not exist on host` failure mode (Pitfall 22)

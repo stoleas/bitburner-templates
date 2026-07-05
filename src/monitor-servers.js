@@ -11,17 +11,18 @@
 //
 // We don't try to scale one server all the way to the cap before
 // moving on. Instead, every tick we pick the CHEAPEST next purchase
-// (a new pserv slot at the current tier's target RAM, OR a 2× RAM
-// upgrade on an existing under-target server) and apply it. This
-// keeps the whole fleet moving in lockstep and stops the per-server
-// cost curve (each 2× scales cost by 6×) from outpacing the wallet.
+// (a new pserv slot at the current tier's target RAM, OR a snap-to-
+// target upgrade on the smallest under-target server) and apply
+// it. This keeps the whole fleet moving in lockstep and stops the
+// per-server cost curve (each size-up scales cost much faster than
+// linearly) from outpacing the wallet.
 //
 // The roster is fixed at the game's 25-server cap (ns.cloud.getServerLimit in 3.0.0).
-// Names are pserv-0..pserv-24. We never rename — a 2× upgrade is
-// deleteServer + purchaseServer at the new size. The lost scripts
-// and tmp data on a delete is a non-issue at this stage of the game
-// (the worker scripts get re-fanned by monitor-deploy.js, and the
-// orchestrator already lives on home).
+// Names are pserv-0..pserv-24. We never rename — a snap-to-target
+// upgrade is deleteServer + purchaseServer at the new (tier) size.
+// The lost scripts and tmp data on a delete is a non-issue at this
+// stage of the game (the worker scripts get re-fanned by
+// monitor-deploy.js, and the orchestrator already lives on home).
 //
 // "sweet-spot" is the only tier we now ship. The previous "soft-cap"
 // 4 TB tier was costing ~$1.15T for 5 servers at $230B each — the
@@ -133,7 +134,7 @@ const MAX_RULE = 1.0;
 // SKIP-reserve) once the wallet drops below this. Set --reserve 0
 // to disable (NOT recommended).
 const DEFAULT_RESERVE = 100e9;          // $100B
-// Safety bound for legacy code paths. The new single-scale-per-pass
+// Safety bound for legacy code paths. The single-scale-per-pass
 // logic doesn't need a walk limit, but the constant is kept for
 // any future expansion (e.g. multi-step scaling) that might want
 // a hard ceiling. Currently unused.
@@ -258,10 +259,25 @@ export async function main(ns) {
     return ns.scp(scripts, host, SOURCE);
   }
 
-  // Cost of scaling a server from `currentGB` to 2× currentGB.
-  // deleteServer + purchaseServer (the API has no in-place upgrade).
-  function costOfDouble(currentGB) {
-    return ns.cloud.getServerCost(Math.min(currentGB * 2, MAX_RAM));
+  // Cost of scaling a server from `currentGB` to `newGB`. The
+  // Bitburner API has no in-place upgrade, so scaling is a
+  // deleteServer + purchaseServer at the new size. The new size
+  // is whatever the upgrade logic decides (2× step OR snap to
+  // tier target), and the cost is the getServerCost of that size.
+  function costOfScale(newGB) {
+    return ns.cloud.getServerCost(Math.min(newGB, MAX_RAM));
+  }
+
+  // Snap a desired size up to the next power of 2. Bitburner
+  // requires purchased-server RAM to be a power of 2 (2, 4, 8,
+  // ..., 65536, ...). 1023 GB is invalid; 1024 GB is valid. We
+  // use this for the snap-to-target upgrade path so a target
+  // like 64 GB → 1024 GB works even if tier.targetGB is the
+  // exact 1024.
+  function ceilPow2AtLeast(gb) {
+    let p = 1;
+    while (p < gb) p *= 2;
+    return Math.min(p, MAX_RAM);
   }
 
   // --- one pass ---
@@ -371,21 +387,35 @@ export async function main(ns) {
       if (verbose) ns.tprint(`SKIP-cap        at game cap (${count}/${MAX_ROSTER})`);
     }
 
-    // 2. Walk every existing pserv and apply AT MOST ONE 2× upgrade.
-    //    Same pattern as monitor-hacknet: cheapest candidate first,
-    //    1-to-3 Rule gates it, no looping over the wallet.
+    // 2. Walk every existing pserv and apply AT MOST ONE snap-to-
+    //    target upgrade. Same pattern as monitor-hacknet: cheapest
+    //    candidate first, 1-to-3 Rule gates it, no looping over
+    //    the wallet.
     //
-    //    The previous version of this loop (a `while` loop that
-    //    walked up to ROSTER_WALK_LIMIT times) would scale 2-3
-    //    servers in a single pass if the wallet allowed. That was
-    //    the second-largest source of the $1.5B wallet drain.
-    //    One scale per pass (matching the one-buy-per-pass above)
-    //    keeps the spend rate bounded at ~3% of wallet per tick.
+    //    SNAP-TO-TARGET (was 2× step). For every pserv under the
+    //    active tier's targetGB, compute the cost to jump DIRECTLY
+    //    to the target. Pick the cheapest such jump (the smallest
+    //    pserv is typically the cheapest to upgrade, since per-GB
+    //    cost grows with size).
+    //
+    //    The 2× step the previous version used was a multi-tick
+    //    walk: 64 → 128 → 256 → 512 → 1024 is 5 ticks per pserv ×
+    //    25 pservs = many minutes of churn. Each tick spent budget
+    //    on a 2× scale that didn't bring the pserv to its final
+    //    size. The snap version lands the FINAL state in one
+    //    delete+rebuy per pserv per tick, gated by the 1-to-3 Rule
+    //    and reserve floor like before.
+    //
+    //    Sourced from skeesler/bitburner-commander/maybeBuyServer
+    //    (commander.js:148-163): "find the smallest server below
+    //    target size and upgrade it." Our pass is the same idea,
+    //    applied per tick with wallet-restraint gates.
     //
     //    We re-read the count after the BUY step so a freshly-bought
     //    pserv is also eligible to be scaled in the same pass.
     const liveCount = currentCount();
     const liveSpendCap = ruleFraction > 0 ? wallet * ruleFraction : Infinity;
+    const targetGB = ceilPow2AtLeast(tier.targetGB);  // power-of-2 snap
     let bestIdx = -1;
     let bestCost = Infinity;
     let absCheapestCost = Infinity;
@@ -394,10 +424,10 @@ export async function main(ns) {
       const name = `${ROSTER_PREFIX}${i}`;
       if (!ns.serverExists(name)) continue;
       const currentGB = ns.getServerMaxRam(name);
-      if (currentGB >= tier.targetGB) continue;     // at or above target
-      if (currentGB >= MAX_RAM) continue;            // at game cap
+      if (currentGB >= targetGB) continue;        // at or above target
+      if (currentGB >= MAX_RAM) continue;          // at game cap
       anyPending = true;
-      const c = costOfDouble(currentGB);
+      const c = costOfScale(targetGB);             // snap to tier target, not 2×
       if (c < absCheapestCost) absCheapestCost = c;
       if (c <= liveSpendCap && c < bestCost) {
         bestCost = c;
@@ -426,13 +456,14 @@ export async function main(ns) {
         }
       }
     } else {
-      // Apply the cheapest scale: delete + repurchase at 2× RAM.
-      // Check the reserve floor on the ACTUAL scale cost (not
-      // absCheapestCost which might be a different, more expensive
-      // candidate that the rule excluded).
+      // Apply the cheapest scale: delete + repurchase at the
+      // target size. Snap-to-target means the new size is
+      // always `targetGB` (the tier's goal, snapped to a power
+      // of 2). If the actual scale cost would drop us below
+      // the reserve floor, skip with SKIP-reserve.
       const targetName = `${ROSTER_PREFIX}${bestIdx}`;
       const currentGB = ns.getServerMaxRam(targetName);
-      const newGB = Math.min(currentGB * 2, MAX_RAM);
+      const newGB = targetGB;
       if (wallet - bestCost < reserveFloor) {
         counters["SKIP-reserve"]++;
         if (verbose) {
